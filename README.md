@@ -1,5 +1,9 @@
 # WS3900A ESPHome firmware
 
+**Beta. Initial installation requires opening the case and serial flashing;
+this can damage or brick your device. No warranty.**
+Independent project, not affiliated with or endorsed by Ecowitt or Fine Offset.
+
 Replacement firmware for the Ecowitt WS3900A console (ESP32-C3). Receives multiple
 Ecowitt / Fine Offset sensors and sends readings to Home Assistant through ESPHome
 or the Ecowitt integration. Includes the console display and buttons, an on-device
@@ -31,18 +35,14 @@ yet documented; confirm connections on the PCB before wiring. GPIO18/19 are used
 by the display/radio, so this configuration disables USB Serial/JTAG.
 Back up the entire 4 MB flash before writing; keep that backup private.
 
-## Warning
+## Notes
 
 This source revision has passed host tests and builds but has not been flashed
 or verified on physical hardware.
 
-Independent project; not affiliated with or endorsed by Ecowitt or Fine Offset.
-Optional cloud uploads use Ecowitt's service and are subject to its terms.
-
-Experimental, unofficial firmware. Flashing can erase settings, void your warranty
-or brick the device. Keep your own stock backup and a serial recovery route. Provided
-**as is, without warranty**; you accept the risk of damage and data loss.
+Keep your own stock backup and a serial recovery route.
 The web interface has no authentication: use it only on a trusted local network.
+Optional cloud uploads use Ecowitt's service and are subject to its terms.
 
 Source is licensed under GPL-3.0-only, with compatible third-party material listed
 in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Run `tests/run.sh` for host checks.
