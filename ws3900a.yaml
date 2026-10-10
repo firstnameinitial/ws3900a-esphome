@@ -1,0 +1,523 @@
+# SPDX-License-Identifier: GPL-3.0-only
+esphome:
+  name: ws3900a
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+    sdkconfig_options:
+      CONFIG_ESP_CONSOLE_SECONDARY_NONE: "y"
+      CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG: "n"
+      CONFIG_USJ_ENABLE_USB_SERIAL_JTAG: "n"
+  flash_size: 4MB
+  flash_mode: dio
+  flash_frequency: 80MHZ
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "WS3900A Fallback"
+    password: !secret fallback_password
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: ws3900a_time
+    timezone: !secret timezone
+    servers:
+      - pool.ntp.org
+
+sun:
+  id: ws3900a_sun
+  time_id: ws3900a_time
+  latitude: !secret latitude
+  longitude: !secret longitude
+
+debug:
+  update_interval: 60s
+
+logger:
+  hardware_uart: UART0
+  level: WARN
+  logs:
+    wifi: WARN
+    api: WARN
+    mqtt: WARN
+    sensor: WARN
+    text_sensor: WARN
+    esp32: WARN
+
+i2c:
+  - id: i2c_bus
+    sda: GPIO9   # indoor I2C SDA (BOOT strapping pin — must stay high at reset; pull-up)
+    scl: GPIO2   # indoor I2C SCL (strapping pin — pull-up)
+    scan: false
+
+sensor:
+  - platform: uptime
+    name: "WS3900A Uptime"
+    update_interval: 60s
+  - platform: ecowitt_rf
+    id: ws3900a_rf
+    i2c_id: i2c_bus
+    time_id: ws3900a_time
+    sun_id: ws3900a_sun
+    device_type: 1
+    ecowitt_ip: !secret ecowitt_ip
+    ecowitt_path: !secret ecowitt_path
+    ecowitt_port: 8123
+    passkey: ""
+    stationtype: "WS3900A-ESPHome"
+    freq: "868M"
+    temperature:
+      name: "WS3900A Indoor Temperature"
+    humidity:
+      name: "WS3900A Indoor Humidity"
+    pressure:
+      name: "WS3900A Pressure"
+    outdoor_temperature:
+      name: "WS3900A Outdoor Temperature"
+    outdoor_humidity:
+      name: "WS3900A Outdoor Humidity"
+    wind_speed:
+      name: "WS3900A Wind Speed"
+    wind_direction:
+      name: "WS3900A Wind Direction"
+    wind_gust:
+      name: "WS3900A Wind Gust"
+    rain:
+      name: "WS3900A Rain"
+    rain_rate:
+      name: "WS3900A Rain Rate"
+    uv_index:
+      name: "WS3900A UV Index"
+    solar_radiation:
+      name: "WS3900A Solar Radiation"
+    soil_moisture:
+      name: "WS3900A Soil Moisture"
+    soil_temperature:
+      name: "WS3900A Soil Temperature"
+    soil_ec:
+      name: "WS3900A Soil EC"
+    pm25:
+      name: "WS3900A PM2.5"
+    pm10:
+      name: "WS3900A PM10"
+    co2:
+      name: "WS3900A CO2"
+    leaf_wetness:
+      name: "WS3900A Leaf Wetness"
+    lightning_strikes:
+      name: "WS3900A Lightning Strikes"
+    lightning_distance:
+      name: "WS3900A Lightning Distance"
+    leak:
+      name: "WS3900A Leak"
+    sensor_roster:
+      name: "WS3900A Sensor Roster"
+    device_info:
+      name: "WS3900A Device Info"
+    panel_mode:
+      name: "WS3900A Panel Mode"
+    upload_switch: cfg_upload_enabled
+    segment_walk_switch: cfg_segment_walk
+    family_switches:
+      - cfg_fam_0
+      - cfg_fam_1
+      - cfg_fam_2
+      - cfg_fam_3
+      - cfg_fam_4
+      - cfg_fam_5
+      - cfg_fam_6
+      - cfg_fam_7
+      - cfg_fam_8
+      - cfg_fam_9
+      - cfg_fam_10
+      - cfg_fam_11
+
+text:
+  - platform: template
+    name: "Upload Host"
+    id: cfg_upload_host
+    mode: text
+    optimistic: true
+    initial_value: !secret ecowitt_ip
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_host(x);'
+  - platform: template
+    name: "Upload Path"
+    id: cfg_upload_path
+    mode: text
+    optimistic: true
+    initial_value: !secret ecowitt_path
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_path(x);'
+  - platform: template
+    name: "Upload Passkey"
+    id: cfg_upload_passkey
+    mode: password
+    optimistic: true
+    initial_value: ""
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_passkey(x);'
+
+number:
+  - platform: template
+    name: "Upload Port"
+    id: cfg_upload_port
+    min_value: 1
+    max_value: 65535
+    step: 1
+    optimistic: true
+    initial_value: 8123
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_port((uint16_t)x);'
+  - platform: template
+    name: "Upload Interval"
+    id: cfg_upload_interval
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 300
+    step: 1
+    optimistic: true
+    initial_value: 16
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_interval((uint16_t)x);'
+  - platform: template
+    name: "Calibration Temperature Offset"
+    unit_of_measurement: "°C"
+    min_value: -10
+    max_value: 10
+    step: 0.1
+    optimistic: true
+    initial_value: 0
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cal_temp(x);'
+  - platform: template
+    name: "Calibration Humidity Offset"
+    unit_of_measurement: "%"
+    min_value: -20
+    max_value: 20
+    step: 1
+    optimistic: true
+    initial_value: 0
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cal_hum(x);'
+  - platform: template
+    name: "Calibration Pressure Offset"
+    unit_of_measurement: "hPa"
+    min_value: -50
+    max_value: 50
+    step: 0.1
+    optimistic: true
+    initial_value: 0
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cal_press(x);'
+  - platform: template
+    name: "Calibration Rain Gain"
+    min_value: 0.5
+    max_value: 1.5
+    step: 0.01
+    optimistic: true
+    initial_value: 1
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cal_rain(x);'
+  - platform: template
+    name: "Calibration Wind Gain"
+    min_value: 0.5
+    max_value: 1.5
+    step: 0.01
+    optimistic: true
+    initial_value: 1
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cal_wind(x);'
+  - platform: template
+    name: "Calibration Solar Gain"
+    min_value: 0.5
+    max_value: 1.5
+    step: 0.01
+    optimistic: true
+    initial_value: 1
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cal_solar(x);'
+  - platform: template
+    name: "Calibration UV Gain"
+    min_value: 0.5
+    max_value: 1.5
+    step: 0.1
+    optimistic: true
+    initial_value: 1
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cal_uv(x);'
+
+select:
+  - platform: template
+    name: "Timezone"
+    id: cfg_timezone
+    optimistic: true
+    initial_option: !secret timezone
+    options:
+      - "Europe/London"
+      - "Europe/Berlin"
+      - "Europe/Paris"
+      - "Europe/Amsterdam"
+      - "Europe/Madrid"
+      - "Europe/Rome"
+      - "UTC"
+      - "America/New_York"
+      - "America/Los_Angeles"
+      - "Australia/Sydney"
+      - "Asia/Tokyo"
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_timezone(x);'
+  - platform: template
+    name: "RF Band"
+    id: cfg_band
+    optimistic: true
+    initial_option: "868 MHz"
+    options:
+      - "433 MHz"
+      - "868 MHz"
+      - "915 MHz"
+      - "920 MHz"
+    on_value:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_band(x == "868 MHz" ? 1 : x == "915 MHz" ? 2 : x == "920 MHz" ? 3 : 0);'
+
+switch:
+  - platform: template
+    name: "Upload Enabled"
+    id: cfg_upload_enabled
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_upload_enabled(true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_cfg_upload_enabled(false);'
+  - platform: template
+    name: "Enable Indoor T⁄H⁄P (WH25⁄WH32)"
+    id: cfg_fam_0
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(0, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(0, false);'
+  - platform: template
+    name: "Enable Outdoor T⁄H (WH31)"
+    id: cfg_fam_1
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(1, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(1, false);'
+  - platform: template
+    name: "Enable Soil Moisture (WH51)"
+    id: cfg_fam_2
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(2, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(2, false);'
+  - platform: template
+    name: "Enable Soil Temperature (WN34⁄WN38)"
+    id: cfg_fam_3
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(3, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(3, false);'
+  - platform: template
+    name: "Enable Soil EC (WH52)"
+    id: cfg_fam_4
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(4, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(4, false);'
+  - platform: template
+    name: "Enable Weather Array (WH24⁄WH65⁄WS69)"
+    id: cfg_fam_5
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(5, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(5, false);'
+  - platform: template
+    name: "Enable Rain Gauge (WH40⁄WN20)"
+    id: cfg_fam_6
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(6, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(6, false);'
+  - platform: template
+    name: "Enable Ultrasonic Array (WS68⁄WS80⁄WS85⁄WS90)"
+    id: cfg_fam_7
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(7, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(7, false);'
+  - platform: template
+    name: "Enable Air Quality (WH0290⁄WH43⁄WH45⁄WH46)"
+    id: cfg_fam_8
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(8, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(8, false);'
+  - platform: template
+    name: "Enable Lightning (WH57)"
+    id: cfg_fam_9
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(9, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(9, false);'
+  - platform: template
+    name: "Enable Leak (WH55⁄WH54)"
+    id: cfg_fam_10
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(10, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(10, false);'
+  - platform: template
+    name: "Enable Leaf Wetness (WH35)"
+    id: cfg_fam_11
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(11, true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_family_enabled(11, false);'
+  - platform: template
+    name: "Segment Walk"
+    id: cfg_segment_walk
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_segment_walk(true);'
+    on_turn_off:
+      then:
+        - lambda: 'id(ws3900a_rf)->set_segment_walk(false);'
+
+button:
+  - platform: template
+    name: "WS3900A Key SET"
+    icon: "mdi:cog"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(0, 1);'
+  - platform: template
+    name: "WS3900A Key SET (hold 2s)"
+    icon: "mdi:cog-outline"
+    entity_category: config
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(0, 2);'
+  - platform: template
+    name: "WS3900A Key TEMP"
+    icon: "mdi:thermometer"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(1, 1);'
+  - platform: template
+    name: "WS3900A Key RAIN1"
+    icon: "mdi:weather-rainy"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(2, 1);'
+  - platform: template
+    name: "WS3900A Key RAIN2"
+    icon: "mdi:weather-pouring"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(3, 1);'
+  - platform: template
+    name: "WS3900A Key WIND"
+    icon: "mdi:weather-windy"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(4, 1);'
+  - platform: template
+    name: "WS3900A Key +"
+    icon: "mdi:plus"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(5, 1);'
+  - platform: template
+    name: "WS3900A Key -"
+    icon: "mdi:minus"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(6, 1);'
+  - platform: template
+    name: "WS3900A Key LIGHT"
+    icon: "mdi:brightness-6"
+    on_press:
+      - lambda: 'id(ws3900a_rf)->inject_key(7, 1);'
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "WS3900A Reset Reason"
