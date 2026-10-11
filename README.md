@@ -30,15 +30,11 @@ Use a **3.3 V UART adapter** and common ground:
 | Ground | GND |
 | Boot strap | GPIO9; ground during reset, then release |
 
-GPIO9 also serves the indoor sensor's I²C SDA. Physical test-pad locations are not
-yet documented; confirm connections on the PCB before wiring. GPIO18/19 are used
+GPIO9 also serves the indoor sensor's I²C SDA. GPIO18/19 are used
 by the display/radio, so this configuration disables USB Serial/JTAG.
 Back up the entire 4 MB flash before writing; keep that backup private.
 
 ## Notes
-
-This source revision has passed host tests and builds but has not been flashed
-or verified on physical hardware.
 
 Keep your own stock backup and a serial recovery route.
 The web interface has no authentication: use it only on a trusted local network.
