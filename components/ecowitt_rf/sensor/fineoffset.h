@@ -237,8 +237,8 @@ class RainAggregator {
         // what RainPersist stores. Never used for deltas: those come from last_raw, so a
         // gain change re-labels this value but cannot inject rain into the running totals.
         float last_counter = -1.0f;   // -1 = uninitialized
-        float last_raw = -1.0f;       // raw sensor counter of the last sample (RAM only)
-        float cal_total = 0;          // RAM-only monotonic sum of calibrated deltas (windows)
+        float last_raw = -1.0f;       // raw sensor counter of the last sample (checkpointed for primary)
+        float cal_total = 0;          // monotonic calibrated delta sum (checkpointed for primary)
         float event_mm = 0, hour_mm = 0, day_mm = 0, week_mm = 0, month_mm = 0, year_mm = 0;
         uint32_t last_rain_ms = 0;    // millis() of last nonzero delta (0 = none this boot)
         uint32_t last_rain_unix = 0;  // unix time of last nonzero delta (persisted; 0 = unknown)

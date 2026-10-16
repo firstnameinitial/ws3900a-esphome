@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// ESPHome custom sensor platform: GW1100 RF receiver + device-config control plane.
+// ESPHome custom sensor platform: WS3900A RF receiver + device-config control plane.
 //
 // Ties together cmt2300a.h (radio init) + fineoffset.h (decode) + ecowitt_upload.h
 // (custom-server HTTP upload). Polls the CMT2300A RX FIFO, decodes a Fine Offset
@@ -9,7 +9,7 @@
 // CONFIG GUI: runtime-editable settings are exposed in the YAML as `template`
 // text/number/select/switch entities whose `on_value`/`on_turn_on`/`on_turn_off`
 // automations call the setters below. Each setter persists to ESPHome preferences
-// (FLASH-backed — see `esp8266: restore_from_flash: true` in the YAML) and applies
+// (ESP32 NVS-backed) and applies
 // immediately, so config survives power loss and is re-applied on boot. Two
 // output-only text_sensors (sensor roster + device info) are owned here directly.
 #pragma once
@@ -50,6 +50,12 @@
 
 #include "cmt2300a.h"
 #include "fineoffset.h"
+#include "rain_checkpoint.h"
+#include "bounded_json.h"
+#include "status_request.h"
+#include <memory>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 #include "ecowitt_upload.h"
 #include "indoor_sensor.h"
 #include "dashboard_html.h"
@@ -65,10 +71,10 @@ namespace ecowitt_rf {
 // ws3900a.yaml if it is ever overridden there.
 static const char *const TAG = "ecowitt_rf";
 
-// Preference type tags (unique within this component). The ESP8266 flash preference sector
-// is only 128 words (512 B); config is one blob and the server list a second, so they share
-// it. Per-sensor overrides are RAM-only (no room) and re-learned on boot.
+// Preference type tags (unique within this component), stored in ESP32 NVS.
+// Keep existing keys and layouts compatible with older firmware for rollback.
 enum : uint32_t {
+    PREF_RAIN_WINDOWS = 0xE621, // versioned primary rolling-rain checkpoint (ESP32 NVS)
     PREF_CFG = 0xE601,       // consolidated DeviceConfig blob
     PREF_RAIN = 0xE612,      // compact rain-aggregate state (first bucket)
     PREF_DISABLED = 0xE614,  // per-sensor disable list
@@ -422,12 +428,13 @@ class EcowittRFSensor : public PollingComponent {
     static constexpr size_t CONFIG_BODY_MAX = 4096;
     // POST /config bodies are validated in the web-server task but APPLIED in loop(): the
     // handler used to mutate upload/extra_servers_ and drive radio + LCD bus writes from the
-    // httpd task, concurrently with loop(). web_mutex_ guards this queue and extra_servers_
-    // (the only non-POD state /state reads while loop() may be rewriting it).
+    // httpd task, concurrently with loop(). web_mutex_ guards this queue and the status-request mailbox.
+    // Status serialization and config application both run in loop().
     static constexpr uint8_t CONFIG_Q_MAX = 4;
     std::string config_q_[CONFIG_Q_MAX];
     uint8_t config_q_head_ = 0, config_q_len_ = 0;
     Mutex web_mutex_;
+    std::shared_ptr<StatusRequest> status_pending_;
 
     // The station's primary outdoor array / rain sensor: the enabled, repeat-seen sensor whose
     // readings drive daily max gust, 10-min wind average, all-time MAX/MIN, and the displayed
@@ -440,6 +447,9 @@ class EcowittRFSensor : public PollingComponent {
     // Rain persistence is throttled: boundary rolls save at once, rain increments at most
     // once per RAIN_SAVE_MS (a wet day used to write flash on every ~9 s packet).
     static constexpr uint32_t RAIN_SAVE_MS = 60000UL;
+    RainCheckpoint rain_checkpoint_;
+    bool rain_restore_pending_ = false, rain_restored_ = false;
+    bool rain_checkpoint_saved_ = false;
     bool rain_save_pending_ = false;
     uint32_t rain_save_ms_ = 0;
 
@@ -551,6 +561,7 @@ class EcowittRFSensor : public PollingComponent {
     }
     void set_cfg_upload_enabled(bool v) {
         cfg_.upload_enabled = v;
+        if (upload_switch_) upload_switch_->publish_state(v);
         save_cfg();
         apply_cfg();
     }
@@ -565,6 +576,7 @@ class EcowittRFSensor : public PollingComponent {
             cfg_.family_enable |= (1u << group);
         else
             cfg_.family_enable &= ~(1u << group);
+        if (group < 12 && family_switches_[group]) family_switches_[group]->publish_state(v);
         save_cfg();
     }
     // ---- HA-injectable keys ----------------------------------------------------------
@@ -772,7 +784,8 @@ class EcowittRFSensor : public PollingComponent {
                 if (r.has(F_WIND)) u.set(UiState::WSPD, r.wind_mps);
                 if (r.has(F_GUST)) u.set(UiState::WGUST, r.gust_mps);
                 if (r.rain_mm > 0) u.set(UiState::RAIN, r.rain_mm);
-                u.set(UiState::RAIN_RATE, r.rain_rate_mmh);
+                if (std::isfinite(r.rain_rate_mmh)) u.set(UiState::RAIN_RATE, r.rain_rate_mmh);
+                else u.seen &= ~(1u << UiState::RAIN_RATE);
                 if (r.has(F_UV)) u.set(UiState::UV, r.uv);
                 if (r.has(F_LIGHT)) u.set(UiState::SOLAR, r.light_wm2);
                 if (r.has(F_TEMP)) u.set(UiState::T_OUT, r.temp_c);
@@ -785,7 +798,8 @@ class EcowittRFSensor : public PollingComponent {
                 if (r.has(F_WIND)) u.set(UiState::WSPD, r.wind_mps);
                 if (r.has(F_GUST)) u.set(UiState::WGUST, r.gust_mps);
                 if (r.rain_mm > 0) u.set(UiState::RAIN, r.rain_mm);
-                u.set(UiState::RAIN_RATE, r.rain_rate_mmh);
+                if (std::isfinite(r.rain_rate_mmh)) u.set(UiState::RAIN_RATE, r.rain_rate_mmh);
+                else u.seen &= ~(1u << UiState::RAIN_RATE);
                 if (r.has(F_UV)) u.set(UiState::UV, r.uv);
                 if (r.has(F_LIGHT)) u.set(UiState::SOLAR, r.light_wm2);
                 if (r.has(F_TEMP)) u.set(UiState::T_OUT, r.temp_c);
@@ -888,6 +902,8 @@ class EcowittRFSensor : public PollingComponent {
             return;
         srv->addHandler(new UrlHandler("/", HTTP_GET,
                                        [this](AsyncWebServerRequest *req) { handle_index(req); }));
+        srv->addHandler(new UrlHandler("/health", HTTP_GET,
+                                       [this](AsyncWebServerRequest *req) { handle_state(req, true); }));
         srv->addHandler(new UrlHandler("/state", HTTP_GET,
                                        [this](AsyncWebServerRequest *req) { handle_state(req); }));
         srv->addHandler(new UrlHandler(
@@ -943,66 +959,134 @@ class EcowittRFSensor : public PollingComponent {
         req->send(200, "text/html; charset=utf-8", DASHBOARD_HTML);
     }
 
-    void handle_state(AsyncWebServerRequest *req) {
-        std::string body = json::build_json([this](JsonObject root) {
-            JsonObject dev = root["dev"].to<JsonObject>();
-            dev["name"] = "WS3900A";
-            {
-                uint8_t mac[6];
-                esp_read_mac(mac, ESP_MAC_WIFI_STA);
-                char macbuf[18];
-                snprintf(macbuf, sizeof(macbuf), "%02X:%02X:%02X:%02X:%02X:%02X",
-                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-                dev["mac"] = macbuf;
-            }
-            if (wifi::global_wifi_component != nullptr) {
-                auto ips = wifi::global_wifi_component->wifi_sta_ip_addresses();
-                std::string ipstr = ips.empty() ? std::string() : ips[0].str();
-                dev["ip"] = ipstr.c_str();
-                dev["ssid"] = wifi::global_wifi_component->get_sta().get_ssid().c_str();
-                dev["wifi_rssi"] = wifi::global_wifi_component->wifi_rssi();
-            } else {
-                dev["ip"] = "";
-                dev["ssid"] = "";
-                dev["wifi_rssi"] = 0;
-            }
-            dev["heap"] = (uint32_t)ESP.getFreeHeap();
-            dev["uptime"] = (uint32_t)(millis() / 1000);
-            dev["fw"] = ESPHOME_VERSION;
-            dev["build"] = "batt-fields-20260927f";
-            dev["ts"] = (uint32_t)::time(nullptr);
+    // The IDF HTTP task only queues and sends. All mutable component data is read
+    // by loop(), into one bounded buffer, without holding a lock across network I/O.
+    void handle_state(AsyncWebServerRequest *req, bool compact = false) {
+        if (ESP.getFreeHeap() < 20000) {
+            req->send(503, "application/json", "{\"err\":\"busy, retry\"}");
+            return;
+        }
+        auto job = std::make_shared<StatusRequest>(compact);
+        bool queued = false;
+        {
+            LockGuard guard(web_mutex_);
+            if (!status_pending_) { status_pending_ = job; queued = true; }
+        }
+        if (!queued) {
+            req->send(503, "application/json", "{\"err\":\"busy, retry\"}");
+            return;
+        }
+        uint32_t began = millis();
+        while (job->status() == StatusRequest::PENDING && millis() - began < 500)
+            vTaskDelay(1);
+        job->cancel();  // no-op if loop() already published READY/FAILED
+        if (job->status() != StatusRequest::READY) {
+            req->send(503, "application/json", "{\"err\":\"busy, retry\"}");
+            return;
+        }
+        httpd_req_t *raw = *req;
+        httpd_resp_set_status(raw, "200 OK");
+        httpd_resp_set_type(raw, "application/json");
+        httpd_resp_set_hdr(raw, "Cache-Control", "no-store");
+        // IDF sends synchronously; job owns the buffer until this call returns.
+        httpd_resp_send(raw, job->body.get(), job->length);
+    }
 
-            JsonObject diag = root["diag"].to<JsonObject>();
-            diag["rssi"] = rssi_dbm_;
-            diag["reg01"] = reg01_;
-            diag["reg02"] = reg02_;
-            diag["reg03"] = reg03_;
-            diag["reg04"] = reg04_;
-            diag["reg17"] = reg17_;
-            diag["reg18"] = reg18_;
-            diag["reg6d"] = reg6d_;
-            diag["reg6e"] = reg6e_;
-            diag["reg6f"] = reg6f_;
-            diag["reg61"] = reg61_;
-            diag["regdump"] = regdump_.c_str();
-            diag["rej_rssi"] = rejected_rssi_;   // frames dropped at the noise floor
-            diag["gpio0_hits"] = gpio0_hits_;    // DEBUG: GPIO0 data-ready assertions
-            diag["gpl_ok"] = gpl_ok_;            // DEBUG: GPL811x ready-check result
-            diag["gpl_scratch"] = gpl_scratch_;  // 0x5a = chip answered
-            diag["keys_raw"] = panel_.raw;       // front-panel key bits (learn pass)
-            diag["keys_stable"] = panel_.stable;
-            diag["panel_mode"] = (uint8_t)panel_.mode;  // 0 normal,1 setting,2 max,3 min,7 alarm,10 info
-            diag["gpl_reg03"] = gpl_reg03_;      // cached key regs
-            diag["gpl_reg13"] = gpl_reg13_;
-            diag["reg3f"] = reg3f_;
-            diag["reg3f_test"] = reg3f_test_;
-            diag["reg43"] = reg43_;
-            diag["reg47"] = reg47_;
-            diag["reg45"] = reg45_;
-            diag["rssi_min"] = rssi_min_;
-            diag["rssi_max"] = rssi_max_;
-            diag["rssi_changes"] = rssi_changes_;
-            diag["last_hex"] = last_hex_.c_str();
+    void drain_status_request() {
+        std::shared_ptr<StatusRequest> job;
+        {
+            LockGuard guard(web_mutex_);
+            job.swap(status_pending_);
+        }
+        if (!job || job->status() != StatusRequest::PENDING) return;
+        BoundedJson count;
+        serialize_state(count, job->compact);
+        const size_t capacity = count.size() + 32;
+        if (!state_response_fits(count.size(), ESP.getFreeHeap(),
+                                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))) {
+            job->complete(nullptr, 0); return;
+        }
+        char *body = static_cast<char *>(std::malloc(capacity));
+        if (!body) { job->complete(nullptr, 0); return; }
+        BoundedJson out(body, capacity);
+        serialize_state(out, job->compact);
+        if (!out.fits()) { std::free(body); job->complete(nullptr, 0); return; }
+        job->complete(body, out.size());
+    }
+
+    void serialize_state(BoundedJson &j, bool compact) {
+        j.object();
+        j.object("dev");
+        j.field("name", "WS3900A");
+        {
+            uint8_t mac[6];
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            char macbuf[18];
+            snprintf(macbuf, sizeof(macbuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            j.field("mac", macbuf);
+        }
+        if (wifi::global_wifi_component != nullptr) {
+            auto ips = wifi::global_wifi_component->wifi_sta_ip_addresses();
+            std::string ipstr = ips.empty() ? std::string() : ips[0].str();
+            j.field("ip", ipstr.c_str());
+            j.field("ssid", wifi::global_wifi_component->get_sta().get_ssid().c_str());
+            j.field("wifi_rssi", wifi::global_wifi_component->wifi_rssi());
+        } else {
+            j.field("ip", "");
+            j.field("ssid", "");
+            j.field("wifi_rssi", 0);
+        }
+        j.field("heap", (uint32_t)ESP.getFreeHeap());
+        j.field("uptime", (uint32_t)(millis() / 1000));
+        j.field("fw", ESPHOME_VERSION);
+        j.field("build", "rain-recovery-20261016");
+        j.field("ts", (uint32_t)::time(nullptr));
+
+        j.field("reset_reason", (int)esp_reset_reason());
+        j.end_object();
+        j.object("recovery");
+        j.field("pending", rain_restore_pending_);
+        j.field("restored", rain_restored_);
+        j.field("saved", rain_checkpoint_saved_);
+        j.end_object();
+        j.object("up");
+        j.field("ok", up_code_ == 200); j.field("last", up_last_);
+        j.field("code", (int)up_code_); j.field("cloud", (int)cloud_code_);
+        j.end_object();
+        j.object("r"); serialize_values(j, ui_); j.end_object();
+        if (!compact) {
+            j.object("diag");
+            j.field("rssi", rssi_dbm_);
+            j.field("reg01", reg01_);
+            j.field("reg02", reg02_);
+            j.field("reg03", reg03_);
+            j.field("reg04", reg04_);
+            j.field("reg17", reg17_);
+            j.field("reg18", reg18_);
+            j.field("reg6d", reg6d_);
+            j.field("reg6e", reg6e_);
+            j.field("reg6f", reg6f_);
+            j.field("reg61", reg61_);
+            j.field("regdump", regdump_.c_str());
+            j.field("rej_rssi", rejected_rssi_);   // frames dropped at the noise floor
+            j.field("gpio0_hits", gpio0_hits_);    // DEBUG: GPIO0 data-ready assertions
+            j.field("gpl_ok", gpl_ok_);            // DEBUG: GPL811x ready-check result
+            j.field("gpl_scratch", gpl_scratch_);  // 0x5a = chip answered
+            j.field("keys_raw", panel_.raw);       // front-panel key bits (learn pass)
+            j.field("keys_stable", panel_.stable);
+            j.field("panel_mode", (uint8_t)panel_.mode);  // 0 normal,1 setting,2 max,3 min,7 alarm,10 info
+            j.field("gpl_reg03", gpl_reg03_);      // cached key regs
+            j.field("gpl_reg13", gpl_reg13_);
+            j.field("reg3f", reg3f_);
+            j.field("reg3f_test", reg3f_test_);
+            j.field("reg43", reg43_);
+            j.field("reg47", reg47_);
+            j.field("reg45", reg45_);
+            j.field("rssi_min", rssi_min_);
+            j.field("rssi_max", rssi_max_);
+            j.field("rssi_changes", rssi_changes_);
+            j.field("last_hex", last_hex_.c_str());
             // Shadow framebuffer, 64 bytes as hex. Read-only diagnostic: lets a host
             // decode every lit segment id ((byte << 8) | bit) against the display.h
             // tables and verify each page-0 field exactly, instead of squinting at a
@@ -1015,75 +1099,66 @@ class EcowittRFSensor : public PollingComponent {
                     fbhex[i * 2 + 1] = HEXD[fb_[i] & 0xF];
                 }
                 fbhex[128] = '\0';
-                diag["fb"] = fbhex;
+                j.field("fb", fbhex);
             }
             // Derived page-0 fields that have no sensor behind them, so they can be read
             // back and checked against the glass without decoding the framebuffer by hand.
-            diag["fc"] = fc_state_;              // forecast state 0..6, 255 = warming up
-            diag["fc_ovr"] = fc_override_;
-            diag["fc_fill"] = fc_fill_;          // hourly pressure samples collected
-            diag["moon"] = moon_phase();         // 0 new .. 4 full .. 7 waning crescent
-            diag["date_sel"] = panel_.date_sel;  // bottom-left row: 0 month, 1 weekday
-            diag["rot_sun"] = panel_.rot_sun;    // mid-right zone: false UVI+SOLAR, true sun
+            j.field("fc", fc_state_);              // forecast state 0..6, 255 = warming up
+            j.field("fc_ovr", fc_override_);
+            j.field("fc_fill", fc_fill_);          // hourly pressure samples collected
+            j.field("moon", moon_phase());         // 0 new .. 4 full .. 7 waning crescent
+            j.field("date_sel", panel_.date_sel);  // bottom-left row: 0 month, 1 weekday
+            j.field("rot_sun", panel_.rot_sun);    // mid-right zone: false UVI+SOLAR, true sun
             {
                 uint8_t h = 0, m = 0;
                 char b[8];
                 if (sun_event(true, h, m)) std::snprintf(b, sizeof(b), "%02u:%02u", h, m);
                 else std::snprintf(b, sizeof(b), "--:--");
-                diag["sunrise"] = b;
+                j.field("sunrise", b);
                 if (sun_event(false, h, m)) std::snprintf(b, sizeof(b), "%02u:%02u", h, m);
                 else std::snprintf(b, sizeof(b), "--:--");
-                diag["sunset"] = b;
+                j.field("sunset", b);
             }
 
-            emit_readings(root);
-            emit_roster(root);
-
-            JsonObject up = root["up"].to<JsonObject>();
-            up["ok"] = (up_code_ == 200);
-            up["last"] = up_last_;
-            up["code"] = (int) up_code_;
-            up["cloud"] = (int) cloud_code_;
-
-            emit_config(root);
-        });
-        req->send(200, "application/json", body.c_str());
+            j.end_object();
+            serialize_roster(j);
+            serialize_config(j);
+        }
+        j.end_object();
     }
 
-    static void emit_values(JsonObject o, const UiState &u) {
+    static void serialize_values(BoundedJson &j, const UiState &u) {
         static const char *const KEYS[UiState::N] = {
             "t_in", "h_in", "p", "t_out", "h_out", "leaf_wet", "wind_dir", "wind_spd",
             "wind_gust", "rain", "rain_rate", "uv", "solar", "soil_moist", "soil_t",
             "soil_ec", "pm25", "pm10", "co2", "light_cnt", "light_dist", "leak",
             "batt_v", "cap_v", "max_gust", "wind_avg", "rain_24h", "rain_state"};
         for (uint8_t i = 0; i < UiState::N; i++)
-            if (u.has(i))
-                o[KEYS[i]] = u.v[i];
+            if (u.has(i) && std::isfinite(u.v[i]))
+                j.field(KEYS[i], u.v[i]);
     }
 
-    void emit_readings(JsonObject root) {
-        emit_values(root["r"].to<JsonObject>(), ui_);
-    }
-
-    void emit_roster(JsonObject root) {
-        JsonArray arr = root["roster"].to<JsonArray>();
+    void serialize_roster(BoundedJson &j) {
+        j.array("roster");
         uint32_t now_unix = (uint32_t)::time(nullptr);
         for (size_t i = 0; i < roster_count_; i++) {
-            JsonObject e = arr.add<JsonObject>();
-            e["fam"] = family_tag(roster_[i].family);
+            j.object();
+            j.field("fam", family_tag(roster_[i].family));
             char id[8];
             std::snprintf(id, sizeof(id), "%06X", roster_[i].id & 0xFFFFFF);
-            e["id"] = id;
+            j.field("id", id);
             int16_t idx = find_sensor((uint8_t)roster_[i].family, roster_[i].id);
-            e["ch"] = (idx >= 0) ? sensor_slots_[idx].channel : roster_[i].channel;
-            e["en"] = (idx >= 0) ? (sensor_slots_[idx].enabled != 0) : true;
-            e["name"] = (idx >= 0) ? sensor_slots_[idx].name : "";
-            e["rssi"] = roster_[i].rssi;
+            j.field("ch", (idx >= 0) ? sensor_slots_[idx].channel : roster_[i].channel);
+            j.field("en", (idx >= 0) ? (sensor_slots_[idx].enabled != 0) : true);
+            j.field("name", (idx >= 0) ? sensor_slots_[idx].name : "");
+            j.field("rssi", roster_[i].rssi);
             uint32_t age_s = (millis() - roster_[i].last_ms) / 1000;
-            e["last"] = (now_unix >= age_s) ? (now_unix - age_s) : 0;
-            e["batt"] = roster_[i].battery_low;
-            emit_values(e["v"].to<JsonObject>(), roster_[i].v);
+            j.field("last", (now_unix >= age_s) ? (now_unix - age_s) : 0);
+            j.field("batt", roster_[i].battery_low);
+            j.object("v"); serialize_values(j, roster_[i].v); j.end_object();
+            j.end_object();
         }
+        j.end_array();
     }
 
     // "****" + the last 4 characters (just "****" for a key of 4 or fewer); "" stays "".
@@ -1098,47 +1173,50 @@ class EcowittRFSensor : public PollingComponent {
         return submitted == nullptr || *submitted == '\0' || mask_secret(stored) == submitted;
     }
 
-    void emit_config(JsonObject root) {
-        JsonObject cfg = root["cfg"].to<JsonObject>();
-        JsonObject up = cfg["up"].to<JsonObject>();
-        up["en"] = cfg_.upload_enabled;
-        up["cloud"] = cfg_.cloud_enabled;
-        up["host"] = cfg_.host;
-        up["path"] = cfg_.path;
-        up["port"] = cfg_.port;
+    void serialize_config(BoundedJson &j) {
+        j.object("cfg");
+        j.object("up");
+        j.field("en", cfg_.upload_enabled);
+        j.field("cloud", cfg_.cloud_enabled);
+        j.field("host", cfg_.host);
+        j.field("path", cfg_.path);
+        j.field("port", cfg_.port);
         // /state is unauthenticated: never echo secrets. The dashboard posts the mask back
         // unchanged, which apply_config() treats as "keep the stored value".
-        up["key"] = mask_secret(cfg_.passkey);
-        up["int"] = cfg_.interval_s;
+        j.field("key", mask_secret(cfg_.passkey).c_str());
+        j.field("int", cfg_.interval_s);
 
-        JsonArray srv = cfg["servers"].to<JsonArray>();
-        LockGuard guard(web_mutex_);   // extra_servers_ is rewritten by loop()
+        j.end_object();
+        j.array("servers");
         for (size_t i = 0; i < extra_count_; ++i) {
-            JsonObject s = srv.add<JsonObject>();
-            s["proto"] = (extra_servers_[i].proto == Protocol::WUNDERGROUND) ? "wunderground"
-                       : (extra_servers_[i].proto == Protocol::MQTT) ? "mqtt" : "ecowitt";
-            s["host"] = extra_servers_[i].host;
-            s["port"] = extra_servers_[i].port;
-            s["path"] = extra_servers_[i].path;
-            s["key"] = mask_secret(extra_servers_[i].key);
-            s["en"] = extra_servers_[i].enabled;
-            s["code"] = (int) extra_code_[i];
+            j.object();
+            j.field("proto", (extra_servers_[i].proto == Protocol::WUNDERGROUND) ? "wunderground"
+                       : (extra_servers_[i].proto == Protocol::MQTT) ? "mqtt" : "ecowitt");
+            j.field("host", extra_servers_[i].host.c_str());
+            j.field("port", extra_servers_[i].port);
+            j.field("path", extra_servers_[i].path.c_str());
+            j.field("key", mask_secret(extra_servers_[i].key).c_str());
+            j.field("en", extra_servers_[i].enabled);
+            j.field("code", (int) extra_code_[i]);
+            j.end_object();
         }
+        j.end_array();
         // Report the zone actually in effect: the compile-time default is Europe/Berlin
         // (ws3900a.yaml). Reporting London made any dashboard save switch the clock to UK time.
-        cfg["tz"] = cfg_.timezone[0] ? cfg_.timezone : "Europe/Berlin";
-        cfg["rf"] = (cfg_.band == 0 ? 433 : cfg_.band == 1 ? 868 : cfg_.band == 2 ? 915 : 920);
+        j.field("tz", cfg_.timezone[0] ? cfg_.timezone : "Europe/Berlin");
+        j.field("rf", (cfg_.band == 0 ? 433 : cfg_.band == 1 ? 868 : cfg_.band == 2 ? 915 : 920));
 
-        JsonObject cal = cfg["cal"].to<JsonObject>();
-        cal["t_off"] = cfg_.cal_temp;
-        cal["h_off"] = cfg_.cal_hum;
-        cal["p_off"] = cfg_.cal_press;
-        cal["rain_g"] = cfg_.cal_rain;
-        cal["wind_g"] = cfg_.cal_wind;
-        cal["solar_g"] = cfg_.cal_solar;
-        cal["uv_g"] = cfg_.cal_uv;
+        j.object("cal");
+        j.field("t_off", cfg_.cal_temp);
+        j.field("h_off", cfg_.cal_hum);
+        j.field("p_off", cfg_.cal_press);
+        j.field("rain_g", cfg_.cal_rain);
+        j.field("wind_g", cfg_.cal_wind);
+        j.field("solar_g", cfg_.cal_solar);
+        j.field("uv_g", cfg_.cal_uv);
 
-        JsonObject fe = cfg["fam_en"].to<JsonObject>();
+        j.end_object();
+        j.object("fam_en");
         static const char *const TAGS[] = {
             "WH25", "WH31", "WH51", "WN34", "WN38", "WH52", "WH24", "WH65", "WS69", "WH40",
             "WN20", "WS68", "WS80", "WS85", "WS90", "WH41", "WH43", "WH45", "WH46", "WH57",
@@ -1146,20 +1224,24 @@ class EcowittRFSensor : public PollingComponent {
         for (const char *t : TAGS) {
             int8_t g = tag_to_group(t);
             if (g >= 0)
-                fe[t] = (cfg_.family_enable & (1u << g)) != 0;
+                j.field(t, (cfg_.family_enable & (1u << g)) != 0);
         }
 
-        JsonArray sa = cfg["sensors"].to<JsonArray>();
+        j.end_object();
+        j.array("sensors");
         for (uint8_t i = 0; i < sensor_count_; i++) {
-            JsonObject s = sa.add<JsonObject>();
-            s["fam"] = family_tag((Family)sensor_slots_[i].family);
+            j.object();
+            j.field("fam", family_tag((Family)sensor_slots_[i].family));
             uint32_t sid = ((uint32_t)sensor_slots_[i].id0 << 16) | ((uint32_t)sensor_slots_[i].id1 << 8) | sensor_slots_[i].id2;
             char id[8];
             std::snprintf(id, sizeof(id), "%06X", sid);
-            s["id"] = id;
-            s["ch"] = sensor_slots_[i].channel;
-            s["en"] = sensor_slots_[i].enabled != 0;
+            j.field("id", id);
+            j.field("ch", sensor_slots_[i].channel);
+            j.field("en", sensor_slots_[i].enabled != 0);
+            j.end_object();
         }
+        j.end_array();
+        j.end_object();
     }
 
     // Web-server task: validate JSON and queue it for loop(). Nothing here touches
@@ -2844,8 +2926,11 @@ class EcowittRFSensor : public PollingComponent {
         }
     }
 
+    void on_shutdown() override { save_rain(); }
+
     void loop() override {
         register_web();  // retry until the shared HTTP server (captive_portal) is up
+        drain_status_request();
         drain_config_queue();  // apply /config POSTs here, never in the web-server task
 
         // GPL811x key scan + panel state machine (stock key_lcd task, lcd_type 4). Keys
@@ -2960,8 +3045,24 @@ class EcowittRFSensor : public PollingComponent {
                     now_unix = (uint32_t)t.timestamp;
                 }
             }
-            rain_.sample((uint8_t)r.family, r.id, raw_rain_mm, doy, hour, week, month, year,
-                         now_ms, agg, now_unix);
+            // A genuinely new primary after the stale grace may replace the saved source.
+            if (rain_primary && rain_restore_pending_ && key != rain_checkpoint_.key)
+                rain_restore_pending_ = false;
+            bool waiting = rain_restore_pending_ && key == rain_checkpoint_.key;
+            if (waiting && now_unix >= rain_checkpoint_.unix_time) {
+                rain_restored_ = rain_checkpoint_.restore(rain_.buckets()[0], now_unix, now_ms);
+                if (rain_restored_) { rain_restore_pending_ = false; waiting = false; }
+            }
+            if (waiting) {
+                // Do not advance saved baselines or publish a false dry/rate reading before NTP.
+                const auto &b = rain_.buckets()[0];
+                agg.event_mm = b.event_mm; agg.hour_mm = b.hour_mm; agg.day_mm = b.day_mm;
+                agg.week_mm = b.week_mm; agg.month_mm = b.month_mm; agg.year_mm = b.year_mm;
+                agg.last24h_mm = agg.last1h_mm = agg.rate_mmh = NAN;
+            } else {
+                rain_.sample((uint8_t)r.family, r.id, raw_rain_mm, doy, hour, week, month, year,
+                             now_ms, agg, now_unix);
+            }
             r.rain_event_mm = agg.event_mm; r.rain_hour_mm = agg.hour_mm; r.rain_day_mm = agg.day_mm;
             r.rain_week_mm = agg.week_mm; r.rain_month_mm = agg.month_mm; r.rain_year_mm = agg.year_mm;
             r.rain_rate_mmh = agg.rate_mmh;
@@ -2991,10 +3092,8 @@ class EcowittRFSensor : public PollingComponent {
         update_ui_state(r, rain_primary);
         publish(r, rain_primary);   // native API + MQTT: cheap and non-blocking, so every packet goes out
 
-        // ★ The HTTP upload path uses BLOCKING sockets (one connect + read per target, and
-        // there can be several). At one upload per received packet — a WS90 bursts every
-        // ~8.8 s — that stalls loop() for seconds at a time and starves the fast RX poll
-        // that actually drains the FIFO. So honour the "Upload Interval" number entity.
+        // Upload sockets stay on the worker task. Honour "Upload Interval" per sensor
+        // to bound queue pressure without starving the fast RF poll.
         // The limit is PER SENSOR (roster slot): one global timestamp let whichever family
         // happened to transmit first after each interval win, starving the others.
         // Remote WH25 is NOT uploaded via the RF loop — the built-in sensor owns the indoor
@@ -3094,11 +3193,10 @@ class EcowittRFSensor : public PollingComponent {
 
  protected:
     DeviceConfig cfg_;
-    // Preference objects are allocated ONCE in setup_prefs() and reused for load/save —
-    // ESP8266's make_preference allocates a NEW flash offset on every call (no hash cache),
-    // so re-creating them in each load/save would read/write different offsets.
+    // Preference objects are allocated once in setup_prefs() and reused for load/save.
     ESPPreferenceObject cfg_pref_;
     ESPPreferenceObject servers_pref_;
+    ESPPreferenceObject rain_windows_pref_;
     ESPPreferenceObject rain_pref_;
     ESPPreferenceObject rain_evt_pref_;  // separate so RainPersist keeps its flash layout
     ESPPreferenceObject disabled_pref_;
@@ -3371,6 +3469,7 @@ class EcowittRFSensor : public PollingComponent {
         cfg_pref_ = global_preferences->make_preference<uint8_t[sizeof(DeviceConfig)]>(PREF_CFG, true);
         servers_pref_ = global_preferences->make_preference<uint8_t[SERVERS_BLOB]>(PREF_SERVERS, true);
         rain_pref_ = global_preferences->make_preference<uint8_t[sizeof(RainPersist)]>(PREF_RAIN, true);
+        rain_windows_pref_ = global_preferences->make_preference<RainCheckpoint>(PREF_RAIN_WINDOWS, true);
         rain_evt_pref_ = global_preferences->make_preference<uint32_t>(PREF_RAIN_EVT, true);
         disabled_pref_ = global_preferences->make_preference<uint8_t[sizeof(DisabledList)]>(PREF_DISABLED, true);
         panel_pref_ = global_preferences->make_preference<uint8_t[sizeof(PanelSettings)]>(PREF_PANEL, true);
@@ -3453,7 +3552,16 @@ class EcowittRFSensor : public PollingComponent {
     // RainPersist.last_counter is the CALIBRATED counter (raw * cal_rain at save time).
     void load_rain() {
         RainPersist rp;
-        if (rain_pref_.load(&rp) && rp.last_counter >= 0.0f) {
+        const bool legacy_loaded = rain_pref_.load(&rp) && std::isfinite(rp.last_counter) && rp.last_counter >= 0;
+        if (rain_windows_pref_.load(&rain_checkpoint_) && rain_checkpoint_.valid() &&
+            (!legacy_loaded || rain_checkpoint_.matches_calendar(rp))) {
+            rain_.set_count(1);
+            rain_checkpoint_.seed(rain_.buckets()[0], rain_.gain());
+            rain_restore_pending_ = true;
+            rain_checkpoint_saved_ = true;
+            return;
+        }
+        if (legacy_loaded) {
             rain_.set_count(1);
             RainAggregator::Bucket &b = rain_.buckets()[0];
             b.key = rp.key;
@@ -3468,6 +3576,8 @@ class EcowittRFSensor : public PollingComponent {
     }
 
     void save_rain() {
+        if (rain_restore_pending_) return; // protect the saved baseline until NTP
+
         rain_save_pending_ = false;
         rain_save_ms_ = millis();
         if (rain_.count() == 0)
@@ -3486,7 +3596,11 @@ class EcowittRFSensor : public PollingComponent {
         rain_pref_.save(&rp);
         uint32_t last_rain_unix = b.last_rain_unix;
         rain_evt_pref_.save(&last_rain_unix);
-        global_preferences->sync();
+        if (time_clock && time_clock->now().is_valid()) {
+            auto snapshot = RainCheckpoint::capture(b, (uint32_t)time_clock->now().timestamp, millis());
+            if (snapshot.valid()) rain_checkpoint_saved_ = rain_windows_pref_.save(&snapshot);
+        }
+        if (!global_preferences->sync()) rain_checkpoint_saved_ = false;
     }
 
     // Per-sensor disable list (the only user-editable override that must survive reboot).

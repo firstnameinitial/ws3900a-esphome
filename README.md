@@ -42,3 +42,33 @@ Optional cloud uploads use Ecowitt's service and are subject to its terms.
 
 Source is licensed under GPL-3.0-only, with compatible third-party material listed
 in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Run `tests/run.sh` for host checks.
+
+## Rain and status recovery
+
+The WS90 `rain_state` signal is a **wet flag**, not proof of measured rain. Use
+measured rain rate for rain notifications; a damp sensor may remain flagged in sunshine.
+
+The primary rain sensor's rolling 24-hour, one-hour and ten-minute windows are saved
+with their matching raw/calibrated baseline and calendar totals in a separate,
+versioned NVS checkpoint. Recovery waits for a valid clock and ages out rainfall
+through downtime. Until then, rolling totals/rate are omitted from HTTP uploads and
+the dashboard, and native rate is unknown. Existing config and calendar preference
+layouts are retained for rollback. A checkpoint that disagrees with newer legacy
+calendar data (for example after running an older firmware) is discarded rather than
+replacing that newer history. Other rain sensors retain independent RAM windows.
+
+Saves keep the existing one-minute rain-write limit, save immediately on calendar
+rolls, and flush on orderly shutdown. Sudden power loss can lose the unsaved tail;
+recovery is from the last valid checkpoint, not a complete historical archive.
+The first upgrade cannot reconstruct rolling rain that earlier firmware never saved.
+Counter increments first observed after an outage have no measurement timestamp and
+are attributed to receipt, as in ordinary RF gaps.
+
+`/state` uses a bounded JSON buffer built on the main loop; `/health` returns a smaller
+snapshot including reset reason, upload status and recovery flags. Busy/low-memory
+requests return HTTP 503 for retry. Uploads keep their separate worker task, and
+configuration changes remain queued for the main loop. Dashboard saves use the IDF
+server's supported `j` form transport and synchronise the native switches.
+
+Run `tests/run.sh` and `node tests/dashboard_test.js`. Source/host/build verification
+does not replace an on-console reboot, power-cycle and LCD/RF/upload acceptance check.

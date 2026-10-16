@@ -233,6 +233,7 @@ inline std::string default_passkey() {
 }
 
 inline void add_field(std::string &url, const char *name, float value) {
+    if (!std::isfinite(value)) return;
     if (!url.empty()) url += '&';
     url += name; url += '=';
     char buf[24];
@@ -240,6 +241,7 @@ inline void add_field(std::string &url, const char *name, float value) {
     url += buf;
 }
 inline void add_field_prec(std::string &url, const char *name, float value, int prec) {
+    if (!std::isfinite(value)) return;
     if (!url.empty()) url += '&';
     url += name; url += '=';
     char buf[24];

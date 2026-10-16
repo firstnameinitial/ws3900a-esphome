@@ -14,6 +14,8 @@ jobs:
           python-version: '3.12'
       - name: Host tests
         run: tests/run.sh
+      - name: Dashboard tests
+        run: node tests/dashboard_test.js
       - name: Install pinned ESPHome
         run: python -m pip install esphome==2026.6.2
       - name: Prepare example configuration
