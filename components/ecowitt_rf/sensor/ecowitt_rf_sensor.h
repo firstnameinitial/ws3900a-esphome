@@ -53,6 +53,7 @@
 #include "rain_checkpoint.h"
 #include "bounded_json.h"
 #include "status_request.h"
+#include "status_response.h"
 #include <memory>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -925,7 +926,7 @@ class EcowittRFSensor : public PollingComponent {
                 bool overflow = body_overflow_;
                 body_overflow_ = false;
                 if (overflow) {
-                    req->send(413, "application/json", "{\"ok\":false,\"err\":\"body too large\"}");
+                    send_json_response(*req, "413 Content Too Large", "{\"ok\":false,\"err\":\"body too large\"}");
                     return;
                 }
                 if (body.empty()) {
@@ -934,7 +935,7 @@ class EcowittRFSensor : public PollingComponent {
                         body = p->value().c_str();
                 }
                 if (body.empty() || body.size() > CONFIG_BODY_MAX) {
-                    req->send(400, "application/json",
+                    send_json_response(*req, "400 Bad Request",
                               "{\"ok\":false,\"err\":\"empty body (send j=<urlencoded json>)\"}");
                     return;
                 }
@@ -963,7 +964,7 @@ class EcowittRFSensor : public PollingComponent {
     // by loop(), into one bounded buffer, without holding a lock across network I/O.
     void handle_state(AsyncWebServerRequest *req, bool compact = false) {
         if (ESP.getFreeHeap() < 20000) {
-            req->send(503, "application/json", "{\"err\":\"busy, retry\"}");
+            send_json_response(*req, "503 Service Unavailable", "{\"err\":\"busy, retry\"}");
             return;
         }
         auto job = std::make_shared<StatusRequest>(compact);
@@ -973,7 +974,7 @@ class EcowittRFSensor : public PollingComponent {
             if (!status_pending_) { status_pending_ = job; queued = true; }
         }
         if (!queued) {
-            req->send(503, "application/json", "{\"err\":\"busy, retry\"}");
+            send_json_response(*req, "503 Service Unavailable", "{\"err\":\"busy, retry\"}");
             return;
         }
         uint32_t began = millis();
@@ -981,15 +982,11 @@ class EcowittRFSensor : public PollingComponent {
             vTaskDelay(1);
         job->cancel();  // no-op if loop() already published READY/FAILED
         if (job->status() != StatusRequest::READY) {
-            req->send(503, "application/json", "{\"err\":\"busy, retry\"}");
+            send_json_response(*req, "503 Service Unavailable", "{\"err\":\"busy, retry\"}");
             return;
         }
-        httpd_req_t *raw = *req;
-        httpd_resp_set_status(raw, "200 OK");
-        httpd_resp_set_type(raw, "application/json");
-        httpd_resp_set_hdr(raw, "Cache-Control", "no-store");
         // IDF sends synchronously; job owns the buffer until this call returns.
-        httpd_resp_send(raw, job->body.get(), job->length);
+        send_json_response(*req, "200 OK", job->body.get(), job->length);
     }
 
     void drain_status_request() {
@@ -1252,20 +1249,22 @@ class EcowittRFSensor : public PollingComponent {
             return true;
         });
         if (ok) {
-            LockGuard guard(web_mutex_);
-            if (config_q_len_ >= CONFIG_Q_MAX) {
-                ok = false;
-            } else {
-                config_q_[(config_q_head_ + config_q_len_) % CONFIG_Q_MAX] = body;
-                config_q_len_++;
-            }
+            {
+                LockGuard guard(web_mutex_);
+                if (config_q_len_ >= CONFIG_Q_MAX) {
+                    ok = false;
+                } else {
+                    config_q_[(config_q_head_ + config_q_len_) % CONFIG_Q_MAX] = body;
+                    config_q_len_++;
+                }
+            } // release the queue lock before a potentially slow network send
             if (!ok) {
-                req->send(503, "application/json", "{\"ok\":false,\"err\":\"busy, retry\"}");
+                send_json_response(*req, "503 Service Unavailable", "{\"ok\":false,\"err\":\"busy, retry\"}");
                 return;
             }
         }
         std::string resp = json::build_json([ok](JsonObject o) { o["ok"] = ok; });
-        req->send(ok ? 200 : 400, "application/json", resp.c_str());
+        send_json_response(*req, ok ? "200 OK" : "400 Bad Request", resp.c_str());
     }
 
     // loop(): apply at most one queued /config body per pass.
