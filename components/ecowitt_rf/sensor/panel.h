@@ -68,10 +68,11 @@ struct Panel {
     // -- display sub-state --
     uint8_t focus = 0;           // selected group: 0=temperature, 1=wind, 2=rain
     uint8_t setting_step = 0;    // menu step 0..15
-    // Main-array variants are temperature, feels-like, dew point, heat index and
-    // wind chill; extra channels follow. Heat index/chill share the FEELSLIKE label.
-    static constexpr uint8_t TEMP_MAIN_N = 5;
+    // Manual: outdoor, feels-like, dew, available channels, auto-scroll.
+    static constexpr uint8_t TEMP_MAIN_N = 3;
     uint8_t temp_sel = 0;        // main-array variant or extra-channel selector
+    bool temp_auto = false;
+    uint32_t temp_rotate_ms = 0;
     uint8_t ext_chan_count = 0;  // extra T/H channels present, set by the component
     uint8_t wind_sel = 0;        // 0=speed 1=gust 2=dir 3=10min-avg
     // The + button switches the bottom-left row between month/day and weekday/day.
@@ -84,7 +85,7 @@ struct Panel {
     // MAX/MIN reuse the whole layout. These selectors choose the outdoor variant.
     uint8_t max_sel = 0;         // MAX outdoor variant 0..2
     uint8_t min_sel = 0;         // MIN outdoor variant 0..2
-    bool mm_gust = true;         // MAX wind zone: true = gust record (the one we keep)
+    bool mm_gust = true;         // MAX wind zone: true = gust, false = sustained speed
     uint8_t alarm_sub = 0;       // Mode 7 sub-menu: 0=hour, 1=minute
     bool alarm_edit = false;
     int32_t scratch = 0;         // reserved; clock/date settings are read-only
@@ -333,7 +334,16 @@ struct Panel {
                             this->fx_reregister = true;  // RF sensor search (stub)
                         else if (e.kind == EvKind::SHORT) {
                             uint8_t n = (uint8_t)(TEMP_MAIN_N + this->ext_chan_count);
-                            this->temp_sel = (uint8_t)((this->temp_sel + 1) % n);
+                            if (this->temp_auto) {
+                                this->temp_auto = false;
+                                this->temp_sel = 0;
+                            } else if (this->temp_sel + 1 >= n) {
+                                this->temp_auto = true;
+                                this->temp_sel = 0;
+                                this->temp_rotate_ms = millis();
+                            } else {
+                                ++this->temp_sel;
+                            }
                             this->focus = 0;
                         }
                         break;
@@ -472,6 +482,15 @@ struct Panel {
     }
 
     void tick() {
+        if (this->mode == DMode::NORMAL && this->temp_auto &&
+            millis() - this->temp_rotate_ms >= 5000) {
+            // Auto-scroll measured outdoor and registered channels; skip derived indices.
+            if (this->ext_chan_count == 0) this->temp_sel = 0;
+            else if (this->temp_sel < TEMP_MAIN_N) this->temp_sel = TEMP_MAIN_N;
+            else if (++this->temp_sel >= TEMP_MAIN_N + this->ext_chan_count) this->temp_sel = 0;
+            this->temp_rotate_ms = millis();
+            this->fx_redraw = true;
+        }
         if (this->mode != DMode::NORMAL && millis() - this->last_act > 30000) {
             this->mode = DMode::NORMAL;
             this->fx_redraw = true;

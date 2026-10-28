@@ -43,6 +43,8 @@ Optional cloud uploads use Ecowitt's service and are subject to its terms.
 Source is licensed under GPL-3.0-only, with compatible third-party material listed
 in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Run `tests/run.sh` for host checks.
 
+Console modes and record behaviour: [Display and buttons](DISPLAY.md).
+
 ## Rain and status recovery
 
 The WS90 `rain_state` signal is a **wet flag**, not proof of measured rain. Use
