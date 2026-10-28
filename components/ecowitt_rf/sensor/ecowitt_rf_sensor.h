@@ -2949,7 +2949,13 @@ class EcowittRFSensor : public PollingComponent {
         const time_t epoch = mktime(&calendar);
         if (epoch < 0) return;
         struct timeval tv{epoch, 0};
-        if (settimeofday(&tv, nullptr) == 0) panel_.fx_redraw = true;
+        if (settimeofday(&tv, nullptr) == 0) {
+            // An intentional calendar edit rebases the daily-reset date without
+            // erasing records; the next local day can roll even after editing back a year.
+            panel_options_.hilo_date = value.year * 10000u + value.month * 100u + value.day;
+            save_panel_options();
+            panel_.fx_redraw = true;
+        }
     }
     void power_tick(bool force = false) {
         const uint32_t now = millis();
