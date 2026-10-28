@@ -14,7 +14,10 @@ inline int raw[5]={1000,1001,1002,1003,1008};
 inline adc_oneshot_chan_cfg_t config{};
 }
 inline int adc_oneshot_io_to_channel(int gpio,adc_unit_t*u,adc_channel_t*c) {
-    if(gpio!=0)return ESP_ERR_INVALID_ARG; *u=ADC_UNIT_1;*c=ADC_CHANNEL_0;return ESP_OK;
+    if (gpio != 0) return ESP_ERR_INVALID_ARG;
+    *u = ADC_UNIT_1;
+    *c = ADC_CHANNEL_0;
+    return ESP_OK;
 }
 inline int adc_oneshot_new_unit(const adc_oneshot_unit_init_cfg_t* cfg,adc_oneshot_unit_handle_t*h) {
     if(cfg->unit_id!=ADC_UNIT_1)return ESP_ERR_INVALID_ARG;
