@@ -96,3 +96,34 @@ Factory-reset scope is deliberately narrower than erasing all ESPHome NVS: appli
 - **Device:** physical page/button sweep; actual DC/battery transitions; clock edits and year/day boundaries; alarm/snooze/held-key consumption; safe APSTA start/expiry; actual electrode photographs. The replacement image is on the device and qualification is underway. Final physical results must be recorded separately from implementation claims. Alarm, buzzer and power timers continue during the segment-walk diagnostic.
 
 No built-in CO2 calibration can be demonstrated on WS3900A without the WS3910 hardware. Optional AQ sensors, WN32P substitution and additional RF families require those transmitters for device qualification. The recording does not establish long-hold, clock edit, supply transition, new AQ, forecast-learning, factory-reset or AP-expiry behavior. No invented readings or unrelated illuminated segments are used to make those areas look populated.
+
+## Integrated qualification receipt —28 October2026
+
+Code004807c passed29 sanitizer C++ programs, both dashboard JavaScript suites,
+and complete pinned ESPHome2026.6.2 Mac/Ubuntu builds. The final image uses68.8%
+of the application slot. The console was upgraded with its private configuration;
+its encrypted native API retained64 entities/55 state publications and no BidCoS.
+
+Remote injected buttons through the normal component handler and the live LCD
+framebuffer verified normal/derived/CH1/Auto, both rain selectors/histogram, all wind
+pages, REL/ABS, sunrise/set, the complete SET sequence and all15 settings steps.
+The physical raw-key scanner/long holds were covered by host tests and the baseline
+owner recording; a post-change finger-operated sweep is a separate observation.
+
+All seven forced forecast compositions passed, including both phases of each storm.
+The exact0x0137 M glyph passed. The31.3°C/−0.1°C records, independent CH1 record,
+503.6mm YEARLY and59.8mm console TOTAL survived the final orderly OTA restart.
+Configuration matched after normal RF rediscovery. Immediate partly-cloudy forecast
+continued; elapsed thirty-day pressure learning cannot be proved by this short trial.
+
+The actual APSTA probe opened while STA, RF and HTTP uploads remained available,
+then closed at the five-minute lease boundary without a reboot; both custom and
+cloud uploads reported200 afterwards. Current requests can still fail transiently
+on weak WiFi, as before this change; this trial is not a long-term delivery guarantee.
+
+Factory reset/re-registration were implemented and scope/failure paths tested on
+host, without deleting the owner's records as a qualification exercise. Actual
+battery/DC transitions, physical cold power loss/delayed NTP, live alarm/snooze
+cadence and optional AQ/WN32P hardware remain hardware qualification items. Calendar,
+AQ packets/sentinels/AQI, power transitions and alarm timing are covered by deterministic
+host fixtures. The source matrix distinguishes those tests from installed hardware.
