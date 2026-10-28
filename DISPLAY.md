@@ -12,6 +12,12 @@
 | Hold − | UV/solar / sunrise/sunset | — |
 | LIGHT | Backlight level | Return to Normal; alarm snooze |
 
+Held-SET menu order: Beep → RST HILO (stored only) → 12/24h → hour → minute →
+year → month → day → pressure unit → relative-pressure offset → temperature unit →
+wind unit → rain unit → solar unit → hemisphere → CO₂ calibration (display only).
+Hour/date fields are read-only because SNTP owns the clock. Sensor re-registration
+and factory-reset actions are currently log-only stubs.
+
 Auto scrolls measured outdoor and enabled, recently received channels every five
 seconds. The channel digit and CH marker identify extra sensors; derived views
 use FEELSLIKE or DEW. The fixed segment glass has no arbitrary sensor-name field.
