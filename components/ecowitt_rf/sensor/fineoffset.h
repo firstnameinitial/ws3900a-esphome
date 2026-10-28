@@ -24,6 +24,7 @@
 #include <cmath>
 #include "esphome/core/log.h"
 #include "rain_window.h"
+#include "rain_policy.h"
 
 namespace esphome {
 namespace ecowitt_rf {
@@ -139,6 +140,8 @@ enum Field : uint32_t {
     F_WIND  = 1u << 3,  F_WDIR  = 1u << 4,  F_GUST  = 1u << 5,
     F_UV    = 1u << 6,  F_LIGHT = 1u << 7,
     F_BATV  = 1u << 8,  F_CAPV  = 1u << 9,
+    F_PM1   = 1u << 10, F_PM25  = 1u << 11,
+    F_PM10  = 1u << 12, F_CO2   = 1u << 13,
 };
 
 struct Reading {
@@ -193,6 +196,11 @@ struct Reading {
     float    lightning_dist_km = 0; // WH57 storm-front distance
 
     bool valid = false;
+    // Appended to preserve all existing field offsets; WH46 carries tenths of µg/m³.
+    float pm1_ugm3 = 0;
+    float pm25_exact_ugm3 = NAN;
+    bool allow_battery_upload = true; // append-only station battery-source ownership gate
+    bool allow_rain_upload = true; // append-only station rain-source ownership gate
 };
 
 // ---- Derived rain aggregates --------------------------------------------------
@@ -222,6 +230,7 @@ struct RainAggregate {
     float rate_mmh = 0;
     float last24h_mm = 0;
     float last1h_mm = 0;   // rolling past hour (Wunderground `rainin`)
+    bool event_history_complete = false;
 };
 
 class RainAggregator {
@@ -233,8 +242,8 @@ class RainAggregator {
         RainWindow1h hourly;
         RainWindow10m recent;
         uint32_t key = 0;             // (family << 24) | (id & 0xFFFFFF)
-        // CALIBRATED lifetime counter (raw * current gain): what the LCD "total" shows and
-        // what RainPersist stores. Never used for deltas: those come from last_raw, so a
+        // CALIBRATED sensor counter (raw * current gain), retained for legacy preferences.
+        // The console TOTAL uses a separate monotonic accumulator, not this value. Never used for deltas: those come from last_raw, so a
         // gain change re-labels this value but cannot inject rain into the running totals.
         float last_counter = -1.0f;   // -1 = uninitialized
         float last_raw = -1.0f;       // raw sensor counter of the last sample (checkpointed for primary)
@@ -248,6 +257,25 @@ class RainAggregator {
         uint8_t  mark_week = 0xFF;
         uint8_t  mark_month = 0xFF;
         uint16_t mark_year = 0;
+
+        // Runtime extensions; original RainPersist/RainCheckpoint layouts stay intact.
+        RainCalendarKeys period_keys;
+        bool calendar_initialized = false, calendar_rebased = false;
+        uint32_t event_coverage_ms = 0, event_coverage_last_ms = 0;
+        bool event_coverage_started = false, rain_seen_this_boot = false;
+
+        static constexpr uint32_t EVENT_WINDOW_MS = 86400000UL;
+        void add_event_coverage(uint32_t elapsed_ms, uint32_t now_ms) {
+            if (elapsed_ms >= EVENT_WINDOW_MS - event_coverage_ms) event_coverage_ms = EVENT_WINDOW_MS;
+            else event_coverage_ms += elapsed_ms;
+            event_coverage_started = true;
+            event_coverage_last_ms = now_ms;
+        }
+        void observe_event_coverage(uint32_t now_ms, bool counter_reset) {
+            if (counter_reset) { event_coverage_ms = 0; event_coverage_started = false; }
+            const uint32_t elapsed = event_coverage_started ? now_ms - event_coverage_last_ms : 0;
+            add_event_coverage(elapsed,now_ms);
+        }
 
         void restore_calendar(uint16_t doy, uint8_t month, uint16_t year) {
             mark_doy = doy;
@@ -269,10 +297,23 @@ class RainAggregator {
     // or the gain changed. The caller saves those at once; plain rain may be throttled.
     bool take_rolled() { bool d = rolled_; rolled_ = false; return d; }
 
+    const RainCalendarPolicy &calendar_policy() const { return calendar_policy_; }
+    bool set_calendar_policy(const RainCalendarPolicy &policy) {
+        if (!policy.valid()) return false;
+        if (policy == calendar_policy_) return true;
+        calendar_policy_ = policy;
+        for (uint8_t i = 0; i < count_; ++i) {
+            buckets_[i].calendar_initialized = false;
+            buckets_[i].calendar_rebased = true;
+        }
+        if (count_) { dirty_ = true; rolled_ = true; }
+        return true;
+    }
+
     // Rain gain (cal_rain). Applied to each raw DELTA at sample time, never to the lifetime
     // counter feeding the aggregation: multiplying the counter used to turn a gain change
     // (1.0 -> 1.1 on a 500 mm counter) into +50 mm of phantom rain in every total and window.
-    // Changing the gain only re-labels the displayed lifetime total (last_counter).
+    // Changing the gain only re-labels the legacy counter (last_counter).
     float gain() const { return gain_; }
     void set_gain(float g) {
         if (!std::isfinite(g) || g <= 0.0f)
@@ -341,6 +382,7 @@ class RainAggregator {
         if (b->last_raw < 0.0f && b->last_counter >= 0.0f)
             b->last_raw = b->last_counter / gain_;
         const bool fresh = b->last_raw < 0.0f;
+        const bool counter_reset = !fresh && counter + 0.005f < b->last_raw;
 
         // Delta vs the previous raw counter (reset/wrap => not negative rain), then gain.
         // Counters step in >= 0.1 mm; anything below 0.005 mm is float noise from recovering
@@ -358,64 +400,52 @@ class RainAggregator {
         out.last24h_mm = b->rolling.sample(b->cal_total, now_ms);
         out.last1h_mm = b->hourly.sample(b->cal_total, now_ms);
         out.rate_mmh = b->recent.sample(b->cal_total, now_ms) * 6.0f;
+        b->observe_event_coverage(now_ms,counter_reset);
+        if (counter_reset) {
+            // Unknown rain during a reset cannot inherit an older wall-clock dry proof,
+            // including a reset seen before NTP has supplied a replacement timestamp.
+            b->last_rain_unix = now_unix;
+            b->rain_seen_this_boot = false;
+        }
 
-        // Roll running totals at local-time period boundaries, BEFORE folding in the delta.
+        // Independent local-calendar boundaries. A changed policy rebases the current
+        // counters rather than pretending their earlier measurements can be reconstructed.
         bool rolled = false;
-        // year=0 means the clock has not synchronised: preserve real calendar marks.
-        if (year != 0) {
-        if (fresh || b->mark_year == 0) {
-            // First ever sample (no persisted state): every period starts at 0. The counter
-            // is the sensor's LIFETIME total, not this year's: seeding year_mm from it made
-            // YEARLY equal TOTAL until 1 January. A restored bucket keeps its saved year_mm.
+        const RainCalendarKeys current = rain_calendar_keys(year,doy,hour,calendar_policy_);
+        if (current.valid) {
+            if (!b->calendar_initialized) {
+                RainCalendarKeys previous;
+                if (!b->calendar_rebased && calendar_policy_ == RainCalendarPolicy{} && b->mark_year)
+                    previous = rain_calendar_keys(b->mark_year,b->mark_doy,b->mark_hour < 24 ? b->mark_hour : 0,calendar_policy_);
+                b->period_keys = previous.valid ? previous : current;
+                b->calendar_initialized = true;
+                if (!previous.valid && b->mark_year) b->calendar_rebased = true;
+            }
+            if (current.season != b->period_keys.season) { b->year_mm = 0; rolled = true; }
+            if (current.month != b->period_keys.month) { b->month_mm = 0; rolled = true; }
+            if (current.week != b->period_keys.week) { b->week_mm = 0; rolled = true; }
+            if (current.day != b->period_keys.day) { b->day_mm = 0; rolled = true; }
+            if (current.hour != b->period_keys.hour) { b->hour_mm = 0; rolled = true; }
+            b->period_keys = current;
+            // Legacy marks remain actual calendar dates; do not encode a season year here.
             b->mark_year = year; b->mark_month = month; b->mark_week = week;
             b->mark_doy = doy; b->mark_hour = hour;
-        } else {
-            // Each period rolls on its own boundary: a new month (or year) must not clear a
-            // week that started in the previous one, as the old cascade did.
-            bool new_year = year != b->mark_year;
-            bool new_day = new_year || doy != b->mark_doy;
-            if (new_year) {
-                b->year_mm = 0;
-                b->mark_year = year;
-                rolled = true;
-            }
-            if (new_year || month != b->mark_month) {
-                b->month_mm = 0;
-                b->mark_month = month;
-                rolled = true;
-            }
-            if (week != b->mark_week) {
-                b->week_mm = 0;
-                b->mark_week = week;
-                rolled = true;
-            }
-            if (new_day) {
-                b->day_mm = 0;
-                b->mark_doy = doy;
-                rolled = true;
-            }
-            if (new_day || hour != b->mark_hour) {
-                b->hour_mm = 0;
-                b->mark_hour = hour;
-                rolled = true;
-            }
-        }
         }
 
-        // Event rain: reset after 24 h with no rain. Judged on wall-clock time when known,
-        // because millis() restarts on every reboot and a console that reboots more often
-        // than daily never reached the 24 h mark (event stuck at 28.8 mm for days).
+        // Manual event boundary: rolling24h <1mm AND no rainfall during the last hour.
+        // A newly initialized/partially restored window must not supply false dry zeros.
+        // Known24h dryness is independent evidence when older firmware lacked windows.
         if (b->event_mm > 0) {
-            if (now_unix != 0 && b->last_rain_unix == 0) {
-                // Restored event with no date (flash from before this field existed):
-                // start the dry clock now so it clears within a day.
-                b->last_rain_unix = now_unix;
-                rolled = true;
-            }
-            bool dry_24h = (now_unix != 0)
-                               ? (now_unix - b->last_rain_unix >= 86400UL)
-                               : (b->last_rain_ms != 0 && (now_ms - b->last_rain_ms) >= 86400000UL);
-            if (dry_24h) {
+            if (now_unix && !b->last_rain_unix) { b->last_rain_unix = now_unix; rolled = true; }
+            const bool wall_time = now_unix && b->last_rain_unix && now_unix >= b->last_rain_unix;
+            const bool dry24 = wall_time ? now_unix - b->last_rain_unix >= 86400UL
+                : b->rain_seen_this_boot && now_ms - b->last_rain_ms >= 86400000UL;
+            const bool full24 = b->event_coverage_ms >= Bucket::EVENT_WINDOW_MS || dry24;
+            const bool dry_hour = wall_time ? now_unix - b->last_rain_unix >= 3600UL
+                : b->rain_seen_this_boot ? now_ms - b->last_rain_ms >= 3600000UL
+                : b->event_coverage_ms >= 3600000UL;
+            if (!delta && full24 && dry_hour && (dry24 || (std::isfinite(out.last24h_mm) &&
+                std::isfinite(out.last1h_mm) && out.last24h_mm < 1.0f && out.last1h_mm < 0.005f))) {
                 b->event_mm = 0;
                 rolled = true;
             }
@@ -423,6 +453,7 @@ class RainAggregator {
 
         if (delta > 0.0f) {
             b->last_rain_ms = now_ms;
+            b->rain_seen_this_boot = true;
             if (now_unix != 0)
                 b->last_rain_unix = now_unix;
             dirty_ = true;
@@ -448,10 +479,12 @@ class RainAggregator {
     static void fill(const Bucket &b, RainAggregate &out) {
         out.event_mm = b.event_mm; out.hour_mm = b.hour_mm; out.day_mm = b.day_mm;
         out.week_mm = b.week_mm; out.month_mm = b.month_mm; out.year_mm = b.year_mm;
+        out.event_history_complete = b.event_coverage_ms >= Bucket::EVENT_WINDOW_MS;
     }
     Bucket buckets_[MAX_BUCKETS];
     uint8_t count_ = 0;
     float gain_ = 1.0f;
+    RainCalendarPolicy calendar_policy_;
     bool dirty_ = false;
     bool rolled_ = false;
 };
@@ -643,6 +676,19 @@ inline bool decode_wh24(const uint8_t *b, size_t n, Reading &r) {
     return true;
 }
 
+// AQ fields use explicit presence flags: clean-air zero is a reading, not absence.
+// The reserved all-ones 14-bit particle value cannot be a sensor measurement.
+inline void decode_aq_pm14(Reading &r, uint16_t raw, uint32_t field, int &value) {
+    if (raw < 0x3fff) {
+        value = (raw + 5) / 10;
+        if (field == F_PM25) r.pm25_exact_ugm3 = raw * 0.1f;
+        r.mark(field);
+    }
+}
+inline void decode_aq_co2(Reading &r, uint16_t raw) {
+    if (raw != 0xffff) { r.co2_ppm = raw; r.mark(F_CO2); }
+}
+
 // WH0290 / Ecowitt WH41 PM2.5 — 8 bytes: FF DD ?P PP ?A AA CC BB (family 0x41/0x42).
 // Ported from rtl_433 src/devices/fineoffset.c:524-573 (fineoffset_WH0290_callback).
 // The GW1100's 4 WH41 channels are assigned by registration; no channel on the wire.
@@ -655,8 +701,8 @@ inline bool decode_wh0290(const uint8_t *b, size_t n, Reading &r) {
     r.id = b[1];
     int bars = ((b[2] & 0x40) >> 4) | ((b[4] & 0xC0) >> 6);  // fineoffset.c:555
     r.battery_low = bars <= 1;
-    r.pm25_ugm3 = ((((b[2] & 0x3F) << 8) | b[3]) + 5) / 10;
-    r.pm10_ugm3 = ((((b[4] & 0x3F) << 8) | b[5]) + 5) / 10;
+    decode_aq_pm14(r, ((b[2] & 0x3F) << 8) | b[3], F_PM25, r.pm25_ugm3);
+    decode_aq_pm14(r, ((b[4] & 0x3F) << 8) | b[5], F_PM10, r.pm10_ugm3);
     r.valid = true;
     return true;
 }
@@ -672,8 +718,8 @@ inline bool decode_wh43(const uint8_t *b, size_t n, Reading &r) {
     r.id = ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
     int bars = ((b[4] & 0x40) >> 4) | ((b[6] & 0xC0) >> 6);  // 6 = external power
     r.battery_low = bars <= 1;
-    r.pm25_ugm3 = ((((b[4] & 0x3F) << 8) | b[5]) + 5) / 10;
-    r.pm10_ugm3 = ((((b[6] & 0x3F) << 8) | b[7]) + 5) / 10;
+    decode_aq_pm14(r, ((b[4] & 0x3F) << 8) | b[5], F_PM25, r.pm25_ugm3);
+    decode_aq_pm14(r, ((b[6] & 0x3F) << 8) | b[7], F_PM10, r.pm10_ugm3);
     r.valid = true;
     return true;
 }
@@ -693,16 +739,16 @@ inline bool decode_wh45(const uint8_t *b, size_t n, Reading &r) {
     if (b[6] != 0xFF && b[6] <= 100) { r.humidity = b[6]; r.mark(F_HUM); }
     int bars = ((b[7] & 0x40) >> 4) | ((b[9] & 0xC0) >> 6);  // 6 = external power
     r.battery_low = bars <= 1;
-    r.pm25_ugm3 = ((((b[7] & 0x3F) << 8) | b[8]) + 5) / 10;
-    r.pm10_ugm3 = ((((b[9] & 0x3F) << 8) | b[10]) + 5) / 10;
-    r.co2_ppm = ((uint16_t)b[11] << 8) | b[12];
+    decode_aq_pm14(r, ((b[7] & 0x3F) << 8) | b[8], F_PM25, r.pm25_ugm3);
+    decode_aq_pm14(r, ((b[9] & 0x3F) << 8) | b[10], F_PM10, r.pm10_ugm3);
+    decode_aq_co2(r, ((uint16_t)b[11] << 8) | b[12]);
     r.valid = true;
     return true;
 }
 
 // WH46 air quality — 21 bytes (WH45 layout + PM1/PM4 + 2 unknown bytes).
-// Ported from rtl_433 src/devices/fineoffset_wh46.c:60-132. PM1/PM4 have no Reading
-// fields and are dropped.
+// Ported from rtl_433 src/devices/fineoffset_wh46.c:60-132. PM1 is carried at
+// bytes13/14 in tenths of µg/m³; PM4 is upload-only in the stock console and omitted here.
 inline bool decode_wh46(const uint8_t *b, size_t n, Reading &r) {
     if (n < 21) return false;
     if (crc8(0x31, b, 19) != b[19]) return false;
@@ -715,9 +761,11 @@ inline bool decode_wh46(const uint8_t *b, size_t n, Reading &r) {
     if (b[6] != 0xFF && b[6] <= 100) { r.humidity = b[6]; r.mark(F_HUM); }
     int bars = ((b[7] & 0x40) >> 4) | ((b[9] & 0xC0) >> 6);  // 6 = external power
     r.battery_low = bars <= 1;
-    r.pm25_ugm3 = ((((b[7] & 0x3F) << 8) | b[8]) + 5) / 10;
-    r.pm10_ugm3 = ((((b[9] & 0x3F) << 8) | b[10]) + 5) / 10;
-    r.co2_ppm = ((uint16_t)b[11] << 8) | b[12];
+    decode_aq_pm14(r, ((b[7] & 0x3F) << 8) | b[8], F_PM25, r.pm25_ugm3);
+    decode_aq_pm14(r, ((b[9] & 0x3F) << 8) | b[10], F_PM10, r.pm10_ugm3);
+    decode_aq_co2(r, ((uint16_t)b[11] << 8) | b[12]);
+    const uint16_t pm1_raw = ((uint16_t)b[13] << 8) | b[14];
+    if (pm1_raw < 0x3fff) { r.pm1_ugm3 = pm1_raw * 0.1f; r.mark(F_PM1); }
     r.valid = true;
     return true;
 }

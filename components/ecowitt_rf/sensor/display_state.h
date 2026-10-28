@@ -7,19 +7,26 @@ struct UiState {
     enum : uint8_t {
         T_IN = 0, H_IN, P, T_OUT, H_OUT, LEAF, WDIR, WSPD, WGUST, RAIN, RAIN_RATE,
         UV, SOLAR, SOIL_MOIST, SOIL_T, SOIL_EC, PM25, PM10, CO2, LIGHT_N, LIGHT_D, LEAK,
-        BAT_V, CAP_V, MAX_GUST, WIND_AVG, RAIN_24H, RAIN_STATE, N
+        BAT_V, CAP_V, MAX_GUST, WIND_AVG, RAIN_24H, RAIN_STATE, PM1, AQI, N
     };
     float v[N] = {0};
     uint32_t seen = 0;
     void set(uint8_t i, float x) { v[i] = x; seen |= (1u << i); }
     bool has(uint8_t i) const { return (seen & (1u << i)) != 0; }
+    void clear(uint8_t i) { seen &= ~(1u << i); }
 };
+static_assert(UiState::N <= 32, "UiState validity mask capacity");
 inline void map_reading(const Reading &r, UiState &u) {
         switch (r.family) {
             case Family::WH25:
-                if (r.has(F_TEMP)) u.set(UiState::T_IN, r.temp_c);
-                if (r.has(F_HUM)) u.set(UiState::H_IN, r.humidity);
-                if (r.has(F_PRESS)) u.set(UiState::P, r.pressure_hpa);
+                if (r.model == 0xD && !r.has(F_PRESS)) {
+                    if (r.has(F_TEMP)) u.set(UiState::T_OUT, r.temp_c);
+                    if (r.has(F_HUM)) u.set(UiState::H_OUT, r.humidity);
+                } else {
+                    if (r.has(F_TEMP)) u.set(UiState::T_IN, r.temp_c);
+                    if (r.has(F_HUM)) u.set(UiState::H_IN, r.humidity);
+                    if (r.has(F_PRESS)) u.set(UiState::P, r.pressure_hpa);
+                }
                 break;
             case Family::WH31:
                 if (r.has(F_TEMP)) u.set(UiState::T_OUT, r.temp_c);
@@ -52,8 +59,8 @@ inline void map_reading(const Reading &r, UiState &u) {
                 if (r.has(F_HUM)) u.set(UiState::H_OUT, r.humidity);
                 if (r.has(F_BATV)) u.set(UiState::BAT_V, r.battery_v);
                 if (r.has(F_CAPV)) u.set(UiState::CAP_V, r.cap_v);
-                if (r.daily_gust_mps > 0) u.set(UiState::MAX_GUST, r.daily_gust_mps);
-                if (r.wind_dir_avg_deg > 0) u.set(UiState::WIND_AVG, r.wind_dir_avg_deg);
+                if (r.has(F_GUST)) u.set(UiState::MAX_GUST, r.daily_gust_mps);
+                if (r.has(F_WDIR)) u.set(UiState::WIND_AVG, r.wind_dir_avg_deg);
                 if (r.last24h_rain_mm >= 0) u.set(UiState::RAIN_24H, r.last24h_rain_mm);
                 u.set(UiState::RAIN_STATE, r.rain_state ? 1 : 0);
                 break;
@@ -72,12 +79,16 @@ inline void map_reading(const Reading &r, UiState &u) {
                 if (r.soil_ec_uscm > 0) u.set(UiState::SOIL_EC, r.soil_ec_uscm);
                 break;
             case Family::WH0290: case Family::WH43:
-                if (r.pm25_ugm3) u.set(UiState::PM25, r.pm25_ugm3);
-                if (r.pm10_ugm3) u.set(UiState::PM10, r.pm10_ugm3);
+                if (r.has(F_PM25)) u.set(UiState::PM25, std::isfinite(r.pm25_exact_ugm3) ? r.pm25_exact_ugm3 : r.pm25_ugm3); else u.clear(UiState::PM25);
+                if (r.has(F_PM10)) u.set(UiState::PM10, r.pm10_ugm3); else u.clear(UiState::PM10);
                 break;
             case Family::WH45: case Family::WH46:
-                if (r.pm25_ugm3) u.set(UiState::PM25, r.pm25_ugm3);
-                if (r.co2_ppm) u.set(UiState::CO2, r.co2_ppm);
+                if (r.has(F_PM25)) u.set(UiState::PM25, std::isfinite(r.pm25_exact_ugm3) ? r.pm25_exact_ugm3 : r.pm25_ugm3); else u.clear(UiState::PM25);
+                if (r.has(F_PM10)) u.set(UiState::PM10, r.pm10_ugm3); else u.clear(UiState::PM10);
+                if (r.has(F_CO2)) u.set(UiState::CO2, r.co2_ppm); else u.clear(UiState::CO2);
+                if (r.has(F_PM1)) u.set(UiState::PM1, r.pm1_ugm3); else u.clear(UiState::PM1);
+                // AQI is derived by an explicitly selected/proven convention, not on wire.
+                u.clear(UiState::AQI);
                 break;
             case Family::WH57:
                 if (r.strikes) u.set(UiState::LIGHT_N, r.strikes);
@@ -91,6 +102,14 @@ inline void map_reading(const Reading &r, UiState &u) {
                 break;
             default: break;
         }
+        if (is_rain_family(r.family)) {
+            if (std::isfinite(r.rain_mm) && r.rain_mm >= 0) u.set(UiState::RAIN, r.rain_mm);
+            if (std::isfinite(r.rain_rate_mmh)) u.set(UiState::RAIN_RATE, r.rain_rate_mmh); else u.clear(UiState::RAIN_RATE);
+            if (std::isfinite(r.last24h_rain_mm)) u.set(UiState::RAIN_24H, r.last24h_rain_mm); else u.clear(UiState::RAIN_24H);
+            u.set(UiState::RAIN_STATE, r.rain_state ? 1 : 0);
+        }
+        if (r.has(F_GUST)) u.set(UiState::MAX_GUST, r.daily_gust_mps);
+        if (r.has(F_WDIR)) u.set(UiState::WIND_AVG, r.wind_dir_avg_deg);
     }
 
 // Extra WH31 channels own their roster values, never the shared OUTDOOR readout.

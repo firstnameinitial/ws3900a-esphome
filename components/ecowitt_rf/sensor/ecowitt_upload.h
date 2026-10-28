@@ -15,6 +15,7 @@
 // recomputes that MD5 from the MAC at runtime; the YAML `passkey` overrides it only if set.
 #pragma once
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <cstdio>
 #include <cstring>
@@ -178,12 +179,21 @@ struct HttpJob {
     volatile int *code_out;
 };
 
+inline std::atomic<uint32_t> &http_success_count() {
+    static std::atomic<uint32_t> count{0};
+    return count;
+}
+inline void record_http_result(int code) {
+    if (code >= 200 && code < 300) http_success_count().fetch_add(1,std::memory_order_relaxed);
+}
+
 inline void http_worker(void *arg) {
     QueueHandle_t q = (QueueHandle_t) arg;
     for (;;) {
         HttpJob *job = nullptr;
         if (xQueueReceive(q, &job, portMAX_DELAY) == pdTRUE && job != nullptr) {
             int code = http_request(job->use_body, job->host, job->port, job->path, job->query);
+            record_http_result(code);
             if (job->code_out != nullptr)
                 *job->code_out = code;
             delete job;
@@ -289,6 +299,14 @@ inline std::string url_encode(const std::string &v) {
 // with the station ID *and* the station key, but a Server has one key field, so it holds
 // "STATIONID:STATIONKEY" (split at the first ':'). A key without ':' is sent as the ID with
 // an empty PASSWORD (WU will reject it; the old hardcoded "password" never worked either).
+inline bool upload_station_outdoor(const Reading &r) {
+    switch (r.family) {
+        case Family::WH24: case Family::WH65: case Family::WS69:
+        case Family::WS68: case Family::WS80: case Family::WS85: case Family::WS90: return true;
+        case Family::WH25: return r.model == 0xD && !r.has(F_PRESS);
+        default: return false;
+    }
+}
 inline std::string wunderground_query(const std::string &key, const Reading &r) {
     std::string q;
     size_t colon = key.find(':');
@@ -299,12 +317,12 @@ inline std::string wunderground_query(const std::string &key, const Reading &r) 
     add_field(q, "dateutc", "now");
     add_field(q, "action", "updateraw");
     constexpr float IN = 1.0f / 25.4f;
-    if (r.has(F_TEMP)) add_field(q, "tempf", r.temp_c * 9.0f / 5.0f + 32.0f);
-    if (r.has(F_HUM)) add_field_i(q, "humidity", r.humidity);
+    if (upload_station_outdoor(r) && r.has(F_TEMP)) add_field(q, "tempf", r.temp_c * 9.0f / 5.0f + 32.0f);
+    if (upload_station_outdoor(r) && r.has(F_HUM)) add_field_i(q, "humidity", r.humidity);
     if (r.has(F_WDIR)) add_field_i(q, "winddir", r.wind_dir_deg);
     if (r.has(F_WIND)) add_field(q, "windspeedmph", r.wind_mps * 2.23694f);
     if (r.has(F_GUST)) add_field(q, "windgustmph", r.gust_mps * 2.23694f);
-    if (is_rain_family(r.family)) {
+    if (is_rain_family(r.family) && r.allow_rain_upload) {
         // WU: rainin = rain over the PAST HOUR, dailyrainin = since local midnight. The
         // lifetime counter is not a WU field (it read as an hourly downpour of the total).
         add_field_prec(q, "rainin", r.last1h_rain_mm * IN, 2);
@@ -344,6 +362,7 @@ inline std::string station_fields(const UploadConfig &cfg) {
 // wind (already sent in both units) appeared. Kept out of reading_query() so HA does not
 // grow a second, inch-denominated set of rain entities.
 inline void add_cloud_rain_fields(std::string &q, const Reading &r) {
+    if (!r.allow_rain_upload) return;
     constexpr float IN = 1.0f / 25.4f;
     switch (r.family) {
         case Family::WS85:
@@ -360,6 +379,7 @@ inline void add_cloud_rain_fields(std::string &q, const Reading &r) {
         case Family::WH65:
         case Family::WS69:
         case Family::WH40:
+        case Family::WN20:
             add_field_prec(q, "rainratein", r.rain_rate_mmh * IN, 3);
             add_field_prec(q, "eventrainin", r.rain_event_mm * IN, 3);
             add_field_prec(q, "hourlyrainin", r.rain_hour_mm * IN, 3);
@@ -398,7 +418,16 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
     std::string q = station_fields(cfg);
 
     switch (r.family) {
-        case Family::WH25:   // indoor T/H/P (WH32/WN32B) — metric
+        case Family::WH25:   // WN32 outdoor is modelD; WN32P/built-in use indoor keys.
+            if (r.model == 0xD && !r.has(F_PRESS)) {
+                if (r.has(F_TEMP)) {
+                    add_field(q, "tempc", r.temp_c);
+                    add_field(q, "tempf", r.temp_c * 9.0f / 5.0f + 32.0f);
+                }
+                if (r.has(F_HUM)) add_field_i(q, "humidity", r.humidity);
+                if (r.has(F_TEMP) && r.has(F_HUM)) add_field(q, "vpd", vpd_inhg(r.temp_c,r.humidity));
+                break;
+            }
             if (r.has(F_TEMP)) {
                 add_field(q, "tempinc", r.temp_c);
                 add_field(q, "tempinf", r.temp_c * 9.0f / 5.0f + 32.0f);  // the Ecowitt app reads the imperial field for indoor
@@ -417,11 +446,15 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
                 add_field_prec(q, "baromrelin", rel_hpa / 33.86f, 3);
                 add_field_prec(q, "baromabsin", r.pressure_hpa / 33.86f, 3);
             }
-            // Console and built-in indoor sensor run off USB — no batteries fitted.
-            // Report OK so the stock-created HA entities stop showing "unavailable":
-            // wh26batt 0 = OK (binary), console_batt 0.0 V = none fitted.
-            add_field_i(q, "wh26batt", 0);
-            add_field(q, "console_batt", 0.0f);
+            if (r.allow_battery_upload) {
+                if (r.model == 0xE) {
+                    // RF indoor replacement has its own battery; it is not the console.
+                    add_field_i(q, "wh25batt", batt_binary(r));
+                } else {
+                    add_field_i(q, "wh26batt", batt_binary(r));
+                    add_field(q, "console_batt", r.battery_v);
+                }
+            }
             break;
 
         case Family::WH31: { // outdoor multi-channel T/H (8 ch)
@@ -437,7 +470,7 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
                 add_field_i(q, k, r.humidity);
             }
             std::snprintf(k, sizeof(k), "batt%d", r.channel);
-            add_field_i(q, k, batt_binary(r));
+            if (r.allow_battery_upload) add_field_i(q, k, batt_binary(r));
             break;
         }
 
@@ -452,7 +485,7 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             std::snprintf(k, sizeof(k), "soilmoisture%d", r.channel);
             add_field_i(q, k, r.moisture_pct);
             std::snprintf(k, sizeof(k), "soilbatt%d", r.channel);
-            add_field(q, k, batt_volts(r));
+            if (r.allow_battery_upload) add_field(q, k, batt_volts(r));
             break;
         }
 
@@ -468,8 +501,9 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
                 add_field(q, "windgustkmh", r.gust_mps * 3.6f);
                 add_field(q, "windgustmph", r.gust_mps * 2.23694f);
             }
-            add_field(q, "maxdailygust", r.daily_gust_mps * 2.23694f);
-            add_field_i(q, "winddir_avg10m", r.wind_dir_avg_deg);
+            if (r.has(F_GUST)) add_field(q, "maxdailygust", r.daily_gust_mps * 2.23694f);
+            if (r.has(F_WDIR)) add_field_i(q, "winddir_avg10m", r.wind_dir_avg_deg);
+            if (r.allow_rain_upload) {
             add_field(q, "rainratemm", r.rain_rate_mmh);
             add_field(q, "eventrainmm", r.rain_event_mm);
             add_field(q, "hourlyrainmm", r.rain_hour_mm);
@@ -478,6 +512,7 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             add_field(q, "monthlyrainmm", r.rain_month_mm);
             add_field(q, "yearlyrainmm", r.rain_year_mm);
             add_field(q, "totalrainmm", r.rain_mm);
+            }
             if (r.has(F_LIGHT)) add_field(q, "solarradiation", r.light_wm2);
             if (r.has(F_UV)) add_field_i(q, "uv", r.uv);
             if (r.has(F_TEMP)) {
@@ -488,28 +523,29 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             if (r.has(F_TEMP) && r.has(F_HUM)) add_field(q, "vpd", vpd_inhg(r.temp_c, r.humidity));
             // NOTE: the WS69 pressure extension is deliberately NOT uploaded — see the
             // barometer-ownership comment in the WS68/80/85/90 case below.
-            add_field_i(q, "wh65batt", batt_binary(r));
+            if (r.allow_battery_upload) add_field_i(q, "wh65batt", batt_binary(r));
             break;
         }
 
         case Family::WH0290: // PM2.5/PM10 (WH41 family)
-            add_field_i(q, "pm25_ch1", r.pm25_ugm3);
-            add_field_i(q, "pm25batt1", batt_level(r));
+            if (r.has(F_PM25)) add_field(q, "pm25_ch1", std::isfinite(r.pm25_exact_ugm3) ? r.pm25_exact_ugm3 : r.pm25_ugm3);
+            if (r.allow_battery_upload) add_field_i(q, "pm25batt1", batt_level(r));
             break;
 
         case Family::WH43:
-            add_field_i(q, "pm25_ch1", r.pm25_ugm3);
-            add_field_i(q, "pm25batt1", batt_level(r));
+            if (r.has(F_PM25)) add_field(q, "pm25_ch1", std::isfinite(r.pm25_exact_ugm3) ? r.pm25_exact_ugm3 : r.pm25_ugm3);
+            if (r.allow_battery_upload) add_field_i(q, "pm25batt1", batt_level(r));
             break;
 
         case Family::WH45:   // CO2 + PM combo: its own *_co2 keys, not the WH41 pm25_ch1 slot
         case Family::WH46:
-            add_field_i(q, "pm25_co2", r.pm25_ugm3);
-            add_field_i(q, "pm10_co2", r.pm10_ugm3);
+            if (r.has(F_PM25)) add_field(q, "pm25_co2", std::isfinite(r.pm25_exact_ugm3) ? r.pm25_exact_ugm3 : r.pm25_ugm3);
+            if (r.has(F_PM1)) add_field(q, "pm1_co2", r.pm1_ugm3);
+            if (r.has(F_PM10)) add_field_i(q, "pm10_co2", r.pm10_ugm3);
             if (r.has(F_TEMP)) add_field(q, "tf_co2", r.temp_c * 9.0f / 5.0f + 32.0f);  // F key; calc.py derives tf_co2c
             if (r.has(F_HUM)) add_field_i(q, "humi_co2", r.humidity);
-            add_field_i(q, "co2", r.co2_ppm);
-            add_field_i(q, "co2_batt", batt_level(r));
+            if (r.has(F_CO2)) add_field_i(q, "co2", r.co2_ppm);
+            if (r.allow_battery_upload) add_field_i(q, "co2_batt", batt_level(r));
             break;
 
         case Family::WN34:   // soil temp (8 ch)
@@ -519,12 +555,14 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             std::snprintf(k, sizeof(k), "tf_ch%d", r.channel);   // F key; calc.py derives tf_chNc
             add_field(q, k, r.soil_temp_c * 9.0f / 5.0f + 32.0f);
             std::snprintf(k, sizeof(k), "tf_batt%d", r.channel);
-            add_field(q, k, batt_volts(r));
+            if (r.allow_battery_upload) add_field(q, k, batt_volts(r));
             break;
         }
 
         case Family::WH40:   // rain gauge
         case Family::WN20:
+            if (r.allow_rain_upload) {
+            add_field(q, "rainratemm", r.rain_rate_mmh);
             add_field(q, "eventrainmm", r.rain_event_mm);
             add_field(q, "hourlyrainmm", r.rain_hour_mm);
             add_field(q, "dailyrainmm", r.rain_day_mm);
@@ -532,7 +570,8 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             add_field(q, "monthlyrainmm", r.rain_month_mm);
             add_field(q, "yearlyrainmm", r.rain_year_mm);
             add_field(q, "totalrainmm", r.rain_mm);
-            add_field(q, (r.family == Family::WN20) ? "wn20batt" : "wh40batt", r.battery_v);  // battery V
+            }
+            if (r.allow_battery_upload) add_field(q, (r.family == Family::WN20) ? "wn20batt" : "wh40batt", r.battery_v);  // battery V
             break;
 
         case Family::WH55: { // leak (4 ch)
@@ -540,7 +579,7 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             std::snprintf(k, sizeof(k), "leak_ch%d", r.channel);
             add_field_i(q, k, r.leak ? 1 : 0);
             std::snprintf(k, sizeof(k), "leakbatt%d", r.channel);
-            add_field_i(q, k, batt_level(r));
+            if (r.allow_battery_upload) add_field_i(q, k, batt_level(r));
             break;
         }
 
@@ -552,7 +591,7 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
                 add_field(q, "lightning_mi", r.lightning_dist_km * 0.621371f);
             }
             add_field_i(q, "lightning_num", (int)r.strikes);
-            add_field_i(q, "wh57batt", batt_level(r));
+            if (r.allow_battery_upload) add_field_i(q, "wh57batt", batt_level(r));
             break;
 
         case Family::WS68:
@@ -568,8 +607,8 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
                 add_field(q, "windgustkmh", r.gust_mps * 3.6f);
                 add_field(q, "windgustmph", r.gust_mps * 2.23694f);
             }
-            add_field(q, "maxdailygust", r.daily_gust_mps * 2.23694f);
-            add_field_i(q, "winddir_avg10m", r.wind_dir_avg_deg);
+            if (r.has(F_GUST)) add_field(q, "maxdailygust", r.daily_gust_mps * 2.23694f);
+            if (r.has(F_WDIR)) add_field_i(q, "winddir_avg10m", r.wind_dir_avg_deg);
             if (r.has(F_LIGHT)) add_field(q, "solarradiation", r.light_wm2);
             if (r.has(F_UV)) add_field_i(q, "uv", r.uv);
             // ★ BAROMETER OWNERSHIP. The WS90 carries its own barometer, but so does the
@@ -587,7 +626,7 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             // piezo rain (WS85/WS90 only; WS68/WS80 have no rain gauge): running
             // hourly/daily/weekly/monthly/yearly totals + event rain + rate (all derived by
             // RainAggregator from the cumulative counter).
-            if (r.family == Family::WS85 || r.family == Family::WS90) {
+            if (r.allow_rain_upload && (r.family == Family::WS85 || r.family == Family::WS90)) {
             add_field(q, "erain_piezomm", r.rain_event_mm);
             add_field(q, "hrain_piezomm", r.rain_hour_mm);
             add_field(q, "drain_piezomm", r.rain_day_mm);
@@ -601,15 +640,15 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             }
             // battery + supercap are VOLTAGES (aioecowitt BATTERY_VOLTAGE / VOLTAGE), not 0/1.
             if (r.family == Family::WS68) {
-                add_field(q, "wh68batt", r.battery_v);   // BATTERY_VOLTAGE, like wh80batt
+                if (r.allow_battery_upload) add_field(q, "wh68batt", r.battery_v);   // BATTERY_VOLTAGE, like wh80batt
             } else if (r.family == Family::WS80) {
-                add_field(q, "wh80batt", r.battery_v);
+                if (r.allow_battery_upload) add_field(q, "wh80batt", r.battery_v);
             } else if (r.family == Family::WS85) {
-                add_field(q, "wh85batt", r.battery_v);
-                if (r.has(F_CAPV)) add_field(q, "ws85cap_volt", r.cap_v);
+                if (r.allow_battery_upload) add_field(q, "wh85batt", r.battery_v);
+                if (r.allow_battery_upload && r.has(F_CAPV)) add_field(q, "ws85cap_volt", r.cap_v);
             } else {  // WS90
-                add_field(q, "wh90batt", r.battery_v);
-                if (r.has(F_CAPV)) add_field(q, "ws90cap_volt", r.cap_v);
+                if (r.allow_battery_upload) add_field(q, "wh90batt", r.battery_v);
+                if (r.allow_battery_upload && r.has(F_CAPV)) add_field(q, "ws90cap_volt", r.cap_v);
             }
             break;
         }
@@ -625,7 +664,7 @@ inline std::string reading_query(const UploadConfig &cfg, const Reading &r) {
             std::snprintf(k, sizeof(k), "soil_ec%d", r.channel);
             add_field(q, k, r.soil_ec_uscm);
             std::snprintf(k, sizeof(k), "soil_ec_batt%d", r.channel);
-            add_field(q, k, batt_volts(r));
+            if (r.allow_battery_upload) add_field(q, k, batt_volts(r));
             break;
         }
 

@@ -191,7 +191,9 @@ constexpr uint16_t SEG_OUT_ONE = 0x2e20;
 constexpr uint16_t SEG_OUT_MINUS = 0x2620;
 constexpr uint16_t SEG_OUTH_PCT = 0x0704;
 constexpr uint16_t SEG_CHAN_TICK = 0x3608;
-constexpr uint16_t SEG_CHAN_ARROW = 0x3d40;
+// Stock indoor renderer0x4205b830: main console low/no-battery indicator.
+constexpr uint16_t SEG_CONSOLE_BATT = 0x3d40;
+constexpr uint16_t SEG_CHAN_ARROW = SEG_CONSOLE_BATT; // legacy misname, kept for compatibility
 
 constexpr uint16_t SEG_IN_DP = 0x3540;
 constexpr uint16_t SEG_IN_C = 0x2540;
@@ -375,7 +377,11 @@ inline void sm_pair(uint8_t *fb, const uint16_t t0[7], const uint16_t t1[7], int
 // Position zero is the leftmost character.
 inline void big_char(uint8_t *fb, uint8_t pos, char c) {
     const uint16_t *tab = (pos == 0) ? SEG_POS0 : (pos == 1) ? SEG_POS1 : SEG_POS2;
-    uint16_t mask = console_glyph(c);
+    // This glass's rounded M uses the top, both outer verticals and upper centre
+    // stroke. The diagonal-heavy generic glyph reads like A beside the A in MAX.
+    // Each selected electrode is independently established by the physical map.
+    uint16_t mask = c == 'M' ? uint16_t((1u << 0) | (1u << 1) | (1u << 2) |
+                                      (1u << 4) | (1u << 5) | (1u << 8)) : console_glyph(c);
     for (uint8_t i = 0; i < 14; i++)
         gpl_set_seg(fb, tab[i], ((mask >> i) & 1) != 0);
 }

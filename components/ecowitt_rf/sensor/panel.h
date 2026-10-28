@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "gpl811x.h"
+#include "panel_clock.h"
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -44,8 +45,7 @@ struct PanelSettings {
     uint8_t press_abs = 0;    // 0=relative, 1=absolute (Normal-page "-" toggle)
     uint8_t beep = 1;         // key beep on/off
     uint8_t h12 = 0;          // 0=24h, 1=12h
-    uint8_t rst_hilo = 0;     // stock setting step 1 "RST HILO" (daily MAX/MIN reset switch).
-                              // Stored and shown only -- our records are all-time.
+    uint8_t rst_hilo = 0;     // 1 = reset recorded daily high/low values at local midnight.
     uint8_t hemisphere = 1;   // 1=north, 0=south
     uint8_t backlight = 3;    // 0..4 (off/low/mid/high/max)
     uint8_t alarm_h = 7, alarm_m = 0, alarm_on = 0;
@@ -75,8 +75,11 @@ struct Panel {
     uint32_t temp_rotate_ms = 0;
     uint8_t ext_chan_count = 0;  // extra T/H channels present, set by the component
     uint8_t wind_sel = 0;        // 0=speed 1=gust 2=dir 3=10min-avg
-    // The + button switches the bottom-left row between month/day and weekday/day.
-    uint8_t date_sel = 0;        // 0 = "JUL 31", 1 = "SUN 31"
+    // + cycles DATE and the available AQ fields; DATE itself alternates every 5 s.
+    uint8_t date_sel = 0;        // automatic 5 s month/weekday phase in DATE
+    uint8_t aq_sel = 0, aq_count = 0;  // 0 DATE, 1..count available AQ fields (component-owned roster)
+    bool has_co2_calibration = false;  // WS3910 built-in sensor only; absent on WS3900A
+    bool dc_power = true, backlight_lit = true;  // updated by component power policy
     // Holding - switches the right-hand rotating zone between UVI/solar and sun times.
     bool rot_sun = false;        // false = UVI + SOLAR (mode 9), true = sunrise + sunset
     bool rain_event = false;     // RAIN1: false=rate, true=event
@@ -88,7 +91,10 @@ struct Panel {
     bool mm_gust = true;         // MAX wind zone: true = gust, false = sustained speed
     uint8_t alarm_sub = 0;       // Mode 7 sub-menu: 0=hour, 1=minute
     bool alarm_edit = false;
-    int32_t scratch = 0;         // reserved; clock/date settings are read-only
+    int32_t scratch = 0;         // settings caption scratch; clock edits are explicit effects
+    ClockField clock_field = ClockField::HOUR;
+    int16_t clock_delta = 0;
+    uint8_t reregister_mode = 0, reregister_index = 0; // 0 primary, 1 channel ordinal, 2 all
     // Setting step 9 (REL pressure): +/- steps accumulated for the component, which owns
     // the relative-pressure offset (units of the display unit's last digit).
     int16_t rel_steps = 0;
@@ -109,16 +115,19 @@ struct Panel {
     bool fx_backlight = false;       // backlight level changed -> reapply PWM
     bool fx_reset_max = false;       // SET 2 s in MAX
     bool fx_reset_min = false;       // SET 2 s in MIN
-    bool fx_factory_reset = false;   // SET+LIGHT 5 s in Normal (log stub)
+    bool fx_factory_reset = false;   // SET+LIGHT 5 s: component resets user application settings
     bool fx_wifi_hotspot = false;    // TEMP+- 2 s in Normal (Wi-Fi AP / hotspot)
     bool fx_settings = false;        // a PanelSettings field changed -> persist
-    bool fx_reregister = false;      // TEMP 2 s / 5 s in Normal (RF sensor search — stub)
+    bool fx_reregister = false;      // TEMP held 5 s: selected primary/channel/all search
+    bool fx_clock = false, fx_co2_calibrate = false;
     bool fx_beep = false;            // key beep (if cfg->beep)
     bool fx_rel = false;             // rel_steps pending (setting step 9)
 
     void clear_fx() {
         fx_redraw = fx_backlight = fx_reset_max = fx_reset_min = fx_factory_reset =
-            fx_wifi_hotspot = fx_settings = fx_reregister = fx_beep = fx_rel = false;
+            fx_wifi_hotspot = fx_settings = fx_reregister = fx_beep = fx_rel =
+            fx_clock = fx_co2_calibrate = false;
+        clock_delta = 0;
     }
 
     // Raw key bits for a button (for chord detection).
@@ -184,7 +193,7 @@ struct Panel {
                     this->xlong_fired = true;
                     this->long_fired = true;
                     e.btn = Btn::SET;
-                    e.kind = EvKind::XLONG;  // component maps this to factory reset stub
+                    e.kind = EvKind::XLONG;  // component performs deliberate application-settings reset
                     return true;
                 }
                 if (dt >= 2000) {
@@ -199,15 +208,24 @@ struct Panel {
                     return true;
                 }
             } else {
-                // Single-key holds
-                if (!this->xlong_fired && dt >= 5000) {
-                    this->xlong_fired = true;
-                }
-                if (!this->long_fired && dt >= 2000) {
-                    this->long_fired = true;
-                    e.btn = this->held;
-                    e.kind = EvKind::LONG;
-                    return true;
+                // TEMP registration is a five-second action. A 2..5 s hold is
+                // consumed without selecting another channel on release.
+                if (this->held == Btn::TEMP) {
+                    if (dt >= 2000) this->long_fired = true;
+                    if (!this->xlong_fired && dt >= 5000) {
+                        this->xlong_fired = true;
+                        e.btn = Btn::TEMP;
+                        e.kind = EvKind::XLONG;
+                        return true;
+                    }
+                } else {
+                    if (!this->xlong_fired && dt >= 5000) this->xlong_fired = true;
+                    if (!this->long_fired && dt >= 2000) {
+                        this->long_fired = true;
+                        e.btn = this->held;
+                        e.kind = EvKind::LONG;
+                        return true;
+                    }
                 }
             }
 
@@ -229,28 +247,19 @@ struct Panel {
     struct StepDef { int8_t field; int16_t lo, hi; };
     static constexpr int8_t F_NONE = -1;   // display-only / read-only step
     static constexpr int8_t F_REL = -2;    // REL pressure (component-owned offset)
-    // field indices into PanelSettings (order of declaration)
+    static constexpr int8_t F_HOUR = -3, F_MINUTE = -4, F_YEAR = -5, F_MONTH = -6, F_DAY = -7;
+    // Public manual order. Indices refer to the unchanged PanelSettings declaration.
     static StepDef step_def(uint8_t step) {
         static const StepDef DEFS[16] = {
-            {6, 0, 1},          // 0 beep on/off
-            {8, 0, 1},          // 1 RST HILO (daily MAX/MIN reset switch)
-            {7, 0, 1},          // 2 12/24 h
-            {F_NONE, 0, 23},    // 3 hour   (SNTP, read-only)
-            {F_NONE, 0, 59},    // 4 minute (SNTP, read-only)
-            {F_NONE, 2000, 2099},  // 5 year (SNTP, read-only)
-            {F_NONE, 1, 12},    // 6 month  (SNTP, read-only)
-            {F_NONE, 1, 31},    // 7 day    (SNTP, read-only)
-            {1, 0, 2},          // 8 pressure unit
-            {F_REL, 0, 0},      // 9 relative pressure
-            {0, 0, 1},          // 10 temperature unit
-            {2, 0, 5},          // 11 wind unit (0,1,2,3,5 -- 4 skipped like stock)
-            {3, 0, 1},          // 12 rain unit
-            {4, 0, 2},          // 13 solar unit
-            {9, 0, 1},          // 14 hemisphere (1 = north)
-            {F_NONE, 0, 1},     // 15 CO2 calibration (WS3910-only; display-only here)
+            {6, 0, 1}, {7, 0, 1},
+            {F_HOUR, 0, 23}, {F_MINUTE, 0, 59}, {F_YEAR, 2000, 2099},
+            {F_MONTH, 1, 12}, {F_DAY, 1, 31},
+            {1, 0, 2}, {F_REL, 0, 0}, {0, 0, 1}, {2, 0, 5},
+            {3, 0, 1}, {4, 0, 2}, {9, 0, 1}, {8, 0, 1}, {F_NONE, 0, 1},
         };
         return DEFS[step & 0x0f];
     }
+    uint8_t last_setting_step() const { return this->has_co2_calibration ? 15 : 14; }
 
     uint8_t *field_ptr(int8_t f) {
         if (f < 0 || this->cfg == nullptr)
@@ -275,11 +284,17 @@ struct Panel {
             this->last_adj_ms = millis();
             return;
         }
+        if (d.field <= F_HOUR && d.field >= F_DAY) {
+            this->clock_field = static_cast<ClockField>(F_HOUR - d.field);
+            this->clock_delta = (int16_t)(this->clock_delta + (inc ? 1 : -1));
+            this->fx_clock = true;
+            this->last_adj_ms = millis();
+            return;
+        }
         uint8_t *p = field_ptr(d.field);
-        if (p == nullptr)
-            return;  // read-only (clock/date: SNTP) or display-only (CO2 calibration)
+        if (p == nullptr) return;
         int32_t v = *p;
-        if (this->setting_step == 11) {
+        if (this->setting_step == 10) {
             v += inc ? 1 : -1;
             if (v == 4) v = inc ? 5 : 3;
             if (v > 5) v = 0;
@@ -306,8 +321,12 @@ struct Panel {
 
         // Chords first (factory reset and Wi-Fi hotspot only fire from Normal, per stock).
         if (e.kind == EvKind::XLONG) {
-            if (this->mode == DMode::NORMAL && e.btn == Btn::SET)
-                this->fx_factory_reset = true;
+            if (this->mode == DMode::NORMAL && e.btn == Btn::SET) this->fx_factory_reset = true;
+            if (this->mode == DMode::NORMAL && e.btn == Btn::TEMP) {
+                this->fx_reregister = true;
+                this->reregister_mode = this->temp_auto ? 2 : this->temp_sel >= TEMP_MAIN_N ? 1 : 0;
+                this->reregister_index = this->temp_sel >= TEMP_MAIN_N ? this->temp_sel - TEMP_MAIN_N : 0;
+            }
             return;
         }
         if (e.kind == EvKind::CHORD_WIFI) {
@@ -330,9 +349,7 @@ struct Panel {
                         }
                         break;
                     case Btn::TEMP:
-                        if (e.kind == EvKind::LONG)
-                            this->fx_reregister = true;  // RF sensor search (stub)
-                        else if (e.kind == EvKind::SHORT) {
+                        if (e.kind == EvKind::SHORT) {
                             uint8_t n = (uint8_t)(TEMP_MAIN_N + this->ext_chan_count);
                             if (this->temp_auto) {
                                 this->temp_auto = false;
@@ -369,7 +386,7 @@ struct Panel {
                         break;
                     case Btn::INC:
                         if (e.kind == EvKind::SHORT)
-                            this->date_sel ^= 1;   // bottom-left row: month <-> weekday
+                            this->aq_sel = (uint8_t)((this->aq_sel + 1) % (this->aq_count + 1));
                         break;
                     case Btn::DOWN:
                         if (e.kind == EvKind::SHORT && this->cfg != nullptr) {
@@ -382,7 +399,9 @@ struct Panel {
                         break;
                     case Btn::LIGHT:
                         if (e.kind == EvKind::SHORT && this->cfg != nullptr) {
-                            this->cfg->backlight = (uint8_t)((this->cfg->backlight + 1) % 5);
+                            this->cfg->backlight = this->dc_power
+                                ? (uint8_t)((this->cfg->backlight + 4) % 5)
+                                : (this->backlight_lit ? 0 : 2);
                             this->fx_backlight = true;
                             this->fx_settings = true;
                         }
@@ -395,15 +414,16 @@ struct Panel {
                 if (e.btn == Btn::LIGHT && e.kind == EvKind::SHORT) {
                     this->mode = DMode::NORMAL;
                 } else if (e.btn == Btn::SET && e.kind == EvKind::SHORT) {
-                    if (++this->setting_step > 15) {
+                    if (++this->setting_step > this->last_setting_step()) {
                         this->setting_step = 0;
                         this->mode = DMode::NORMAL;  // F_ReturnNormalMode at end of steps
                     }
                 } else if (adj && (e.kind == EvKind::SHORT || e.kind == EvKind::REPEAT ||
                                    e.kind == EvKind::LONG)) {
                     step_adjust(inc, e.kind == EvKind::REPEAT);
-                } else if (e.btn == Btn::WIND && e.kind == EvKind::SHORT && this->setting_step == 15) {
-                    ESP_LOGW("panel", "CO2 calibration step: not implemented (WS3910-only)");  // TODO
+                } else if (e.btn == Btn::WIND && e.kind == EvKind::SHORT &&
+                           this->setting_step == 15 && this->has_co2_calibration) {
+                    this->fx_co2_calibrate = true;
                 }
                 break;
 
@@ -416,11 +436,11 @@ struct Panel {
                 } else if (e.btn == Btn::SET && e.kind == EvKind::LONG) {
                     this->fx_reset_max = true;
                 } else if (e.btn == Btn::TEMP && e.kind == EvKind::SHORT) {
-                    this->max_sel = (uint8_t)((this->max_sel + 1) % 3);
+                    this->max_sel = (uint8_t)((this->max_sel + 1) % (TEMP_MAIN_N + this->ext_chan_count));
                 } else if (e.btn == Btn::WIND && e.kind == EvKind::SHORT) {
                     this->mm_gust = !this->mm_gust;   // wind speed <-> gust record
                 } else if (adj && e.kind == EvKind::SHORT) {
-                    this->max_sel = (uint8_t)((this->max_sel + (inc ? 1 : 2)) % 3);
+                    this->max_sel = (uint8_t)((this->max_sel + (inc ? 1 : TEMP_MAIN_N + this->ext_chan_count - 1)) % (TEMP_MAIN_N + this->ext_chan_count));
                 }
                 break;
 
@@ -434,9 +454,9 @@ struct Panel {
                 } else if (e.btn == Btn::SET && e.kind == EvKind::LONG) {
                     this->fx_reset_min = true;
                 } else if (e.btn == Btn::TEMP && e.kind == EvKind::SHORT) {
-                    this->min_sel = (uint8_t)((this->min_sel + 1) % 3);
+                    this->min_sel = (uint8_t)((this->min_sel + 1) % (TEMP_MAIN_N + this->ext_chan_count));
                 } else if (adj && e.kind == EvKind::SHORT) {
-                    this->min_sel = (uint8_t)((this->min_sel + (inc ? 1 : 2)) % 3);
+                    this->min_sel = (uint8_t)((this->min_sel + (inc ? 1 : TEMP_MAIN_N + this->ext_chan_count - 1)) % (TEMP_MAIN_N + this->ext_chan_count));
                 }
                 break;
 
@@ -482,6 +502,10 @@ struct Panel {
     }
 
     void tick() {
+        if (this->aq_sel > this->aq_count) this->aq_sel = 0;
+        if (this->aq_sel == 0) this->date_sel = (uint8_t)((millis() / 5000) & 1);
+        if (this->temp_sel >= TEMP_MAIN_N + this->ext_chan_count)
+            this->temp_sel = 0;
         if (this->mode == DMode::NORMAL && this->temp_auto &&
             millis() - this->temp_rotate_ms >= 5000) {
             // Auto-scroll measured outdoor and registered channels; skip derived indices.

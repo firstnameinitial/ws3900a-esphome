@@ -74,3 +74,12 @@ server's supported `j` form transport and synchronise the native switches.
 
 Run `tests/run.sh` and `node tests/dashboard_test.js`. Source/host/build verification
 does not replace an on-console reboot, power-cycle and LCD/RF/upload acceptance check.
+
+The complete button/segment comparison, intentional sparse pages and qualification
+limits are in [the panel capability audit](docs/panel-capability-audit.md).
+System → Console configures daily records, the lighting schedule, rain calendar
+and traditional/piezo preference. New checkpoints preserve the original preferences.
+The forecast starts partly cloudy and learns from real timestamped pressure readings;
+its trend baseline progressively fills over thirty observed days.
+
+Dashboard checks also include `node tests/dashboard_panel_test.js`.

@@ -94,6 +94,10 @@ struct RainCheckpoint {
         if (!b.rolling.restore(rolling, elapsed, now_ms) ||
             !b.hourly.restore(hourly, elapsed, now_ms) || !b.recent.restore(recent, elapsed, now_ms)) return false;
         b.last_raw = last_raw; b.cal_total = cal_total; b.last_sample_ms = now_ms;
+        // Runtime coverage is carried by the separate continuity checkpoint when present.
+        // Even an older partial checkpoint gains known observation time during downtime;
+        // a changed/reset counter on the next RF packet invalidates this proof again.
+        b.add_event_coverage(elapsed,now_ms);
         return true;
     }
 };

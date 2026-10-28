@@ -51,6 +51,7 @@
 #include "cmt2300a.h"
 #include "fineoffset.h"
 #include "rain_checkpoint.h"
+#include "rain_total.h"
 #include "bounded_json.h"
 #include "status_request.h"
 #include "status_response.h"
@@ -65,6 +66,20 @@
 #include "display_history.h"
 #include "display_state.h"
 #include "panel.h"
+#include "panel_options.h"
+#include "wifi_indicator.h"
+#include "upload_selection.h"
+#include "startup_display.h"
+#include "channel_history.h"
+#include "forecast_history.h"
+#include "segment_render.h"
+#include "alarm_state.h"
+#include "air_quality.h"
+#include "source_selection.h"
+#include "panel_hotspot.h"
+#include "console_power.h"
+#include "application_reset.h"
+#include <sys/time.h>
 
 namespace esphome {
 namespace ecowitt_rf {
@@ -79,6 +94,10 @@ static const char *const TAG = "ecowitt_rf";
 enum : uint32_t {
     PREF_RAIN_WINDOWS = 0xE621, // versioned primary rolling-rain checkpoint (ESP32 NVS)
     PREF_DISPLAY_HISTORY = 0xE622, // extended display records; legacy blob retained
+    PREF_FORECAST = 0xE623,
+    PREF_PANEL_OPTIONS = 0xE624,
+    PREF_CHANNEL_HISTORY = 0xE626,
+    PREF_RAIN_TOTAL = 0xE625,
     PREF_CFG = 0xE601,       // consolidated DeviceConfig blob
     PREF_RAIN = 0xE612,      // compact rain-aggregate state (first bucket)
     PREF_DISABLED = 0xE614,  // per-sensor disable list
@@ -432,6 +451,7 @@ class EcowittRFSensor : public PollingComponent {
     // same grace). Neighbours' and disabled arrays never qualify.
     static constexpr uint32_t PRIMARY_STALE_MS = 3600000UL;
     uint32_t primary_array_key_ = 0, primary_array_ms_ = 0;
+    uint32_t primary_th_key_ = 0, primary_uv_key_ = 0, primary_solar_key_ = 0, primary_indoor_key_ = 0;
     uint32_t primary_rain_key_ = 0, primary_rain_ms_ = 0;
     // Rain persistence is throttled: boundary rolls save at once, rain increments at most
     // once per RAIN_SAVE_MS (a wet day used to write flash on every ~9 s packet).
@@ -576,11 +596,11 @@ class EcowittRFSensor : public PollingComponent {
     // hold semantics and the settings-persist side effects all run identically.
     //
     // btn: 0=SET 1=TEMP 2=RAIN1 3=RAIN2 4=WIND 5=+ 6=- 7=LIGHT   (Btn enum, panel.h)
-    // kind: 1=SHORT 2=LONG(2 s) 3=XLONG(5 s) 4=REPEAT             (EvKind enum)
+    // kind: 1=SHORT 2=LONG(2 s) 3=XLONG(5 s) 4=REPEAT 5=TEMP+DOWN chord             (EvKind enum)
     // The queue is drained one event per loop() pass so a burst of HA presses is stepped
     // through the state machine in order rather than collapsing into one redraw.
     void inject_key(uint8_t btn, uint8_t kind = 1) {
-        if (btn > 7 || kind == 0 || kind > 4) {
+        if (btn > 7 || kind == 0 || kind > 5 || (kind == 5 && btn != (uint8_t)Btn::TEMP)) {
             ESP_LOGW(TAG, "inject_key: bad btn=%u kind=%u ignored", btn, kind);
             return;
         }
@@ -761,6 +781,57 @@ class EcowittRFSensor : public PollingComponent {
         update_shared_reading(r, ui_, rain_primary, array_primary);
     }
 
+    int16_t roster_by_key(uint32_t key) const {
+        for (size_t i = 0; i < roster_count_; ++i)
+            if ((((uint32_t)roster_[i].family << 24) | (roster_[i].id & 0xffffff)) == key) return (int16_t)i;
+        return -1;
+    }
+    void select_display_sources() {
+        SourceCandidate candidates[32];
+        const uint32_t now = millis();
+        for (size_t i = 0; i < roster_count_; ++i) {
+            const auto &e = roster_[i];
+            candidates[i] = {((uint32_t)e.family << 24) | (e.id & 0xffffff), e.family, e.model,
+                e.accepted, e.last_ms && now - e.last_ms < 300000UL,
+                family_enabled(e.family) && !is_disabled((uint8_t)e.family, e.id), e.fields,
+                is_rain_family(e.family)};
+        }
+        primary_th_key_ = select_outdoor_source(candidates, roster_count_, primary_th_key_);
+        primary_array_key_ = select_wind_source(candidates, roster_count_, primary_array_key_);
+        primary_uv_key_ = select_solar_source(candidates, roster_count_, F_UV, primary_uv_key_);
+        primary_solar_key_ = select_solar_source(candidates, roster_count_, F_LIGHT, primary_solar_key_);
+        primary_indoor_key_ = select_indoor_override(candidates, roster_count_, primary_indoor_key_);
+        const uint32_t rain_key = select_rain_source(candidates, roster_count_, panel_options_.rain_prefer_piezo
+            ? RainSourcePreference::Piezo : RainSourcePreference::Traditional, primary_rain_key_);
+        // Before the saved rain source is rediscovered, keep its checkpoint protected.
+        if (rain_key || !rain_restore_pending_) primary_rain_key_ = rain_key;
+    }
+    void copy_selected_slots(uint32_t key, std::initializer_list<uint8_t> slots) {
+        const int16_t idx = roster_by_key(key);
+        for (uint8_t slot : slots) {
+            if (idx >= 0 && roster_[idx].v.has(slot)) ui_.set(slot, roster_[idx].v.v[slot]);
+            else ui_.clear(slot);
+        }
+    }
+    void refresh_selected_values() {
+        copy_selected_slots(primary_th_key_, {UiState::T_OUT, UiState::H_OUT});
+        copy_selected_slots(primary_array_key_, {UiState::WDIR, UiState::WSPD, UiState::WGUST,
+            UiState::BAT_V, UiState::CAP_V, UiState::MAX_GUST, UiState::WIND_AVG});
+        copy_selected_slots(primary_uv_key_, {UiState::UV});
+        copy_selected_slots(primary_solar_key_, {UiState::SOLAR});
+        copy_selected_slots(primary_rain_key_, {UiState::RAIN, UiState::RAIN_RATE, UiState::RAIN_24H, UiState::RAIN_STATE});
+        if (primary_indoor_key_) copy_selected_slots(primary_indoor_key_, {UiState::T_IN, UiState::H_IN, UiState::P});
+    }
+    void track_selected_extra_history(const Reading &r, uint32_t key) {
+        if (key == primary_array_key_) {
+            if (r.has(F_WIND)) history_dirty_ |= history_.sample(DisplayHistory::WIND, r.wind_mps);
+            if (r.has(F_GUST)) history_dirty_ |= history_.sample(DisplayHistory::GUST, r.gust_mps);
+        }
+        if (key == primary_uv_key_ && r.has(F_UV)) history_dirty_ |= history_.sample(DisplayHistory::UV, r.uv);
+        if (key == primary_solar_key_ && r.has(F_LIGHT)) history_dirty_ |= history_.sample(DisplayHistory::SOLAR, r.light_wm2);
+        if (key == primary_indoor_key_) track_display_history(r, false, false, true);
+    }
+
     // Latch `slot` to `key` if it is free or its holder has not been accepted for
     // PRIMARY_STALE_MS; refresh it when `key` already holds it. True if `key` is primary.
     static bool claim_primary(uint32_t &slot, uint32_t &slot_ms, uint32_t key, uint32_t now_ms) {
@@ -928,7 +999,7 @@ class EcowittRFSensor : public PollingComponent {
         j.field("heap", (uint32_t)ESP.getFreeHeap());
         j.field("uptime", (uint32_t)(millis() / 1000));
         j.field("fw", ESPHOME_VERSION);
-        j.field("build", "display-fixes-20261028a");
+        j.field("build", "full-panel-20261028c");
         j.field("ts", (uint32_t)::time(nullptr));
 
         j.field("reset_reason", (int)esp_reset_reason());
@@ -937,6 +1008,9 @@ class EcowittRFSensor : public PollingComponent {
         j.field("pending", rain_restore_pending_);
         j.field("restored", rain_restored_);
         j.field("saved", rain_checkpoint_saved_);
+        j.field("console_total", rain_console_total_.value());
+        j.field("total_migrated", rain_console_total_.migrated());
+        j.field("total_history_incomplete", rain_console_total_.history_incomplete());
         j.end_object();
         j.object("up");
         j.field("ok", up_code_ == 200); j.field("last", up_last_);
@@ -991,9 +1065,29 @@ class EcowittRFSensor : public PollingComponent {
             }
             // Derived page-0 fields that have no sensor behind them, so they can be read
             // back and checked against the glass without decoding the framebuffer by hand.
-            j.field("fc", fc_state_);              // forecast state 0..6, 255 = warming up
+            j.field("fc", forecast_history_.forecast_state(forecast_outdoor_temp()));              // cold-start partly cloudy, then learned state 0..6
             j.field("fc_ovr", fc_override_);
-            j.field("fc_fill", fc_fill_);          // hourly pressure samples collected
+            j.field("fc_fill", forecast_history_.hourly.size);
+            j.field("fc_days", forecast_history_.daily.size);
+            j.field("fc_trained", forecast_history_.trained(panel_unix_time()));
+            j.field("fc_clock_wait", forecast_history_.waiting_for_clock(panel_unix_time()));
+            j.field("dc_power", dc_power_);
+            j.field("console_battery_known", console_power_.known());
+            j.field("console_battery_mv", console_power_.millivolts());
+            j.field("console_battery_low", console_power_.known() && console_power_.low());
+            j.field("console_battery_error", console_power_.error());
+            j.field("hotspot", panel_hotspot_.active());
+            j.field("hotspot_remaining_ms", panel_hotspot_.remaining_ms(millis()));
+            j.field("aqi_convention", "US EPA 2012 (stock)");
+            j.field("source_th", primary_th_key_);
+            j.field("source_wind", primary_array_key_);
+            j.field("source_uv", primary_uv_key_);
+            j.field("source_solar", primary_solar_key_);
+            j.field("source_indoor", primary_indoor_key_);
+            j.field("backlight", backlight_policy_.effective_level);
+            j.field("daily_hilo", pset_.rst_hilo != 0);
+            j.field("hilo_date", panel_options_.hilo_date);
+            j.field("aq_sel", panel_.aq_sel);          // date/AQ row selector
             j.field("moon", moon_phase());         // 0 new .. 4 full .. 7 waning crescent
             j.field("date_sel", panel_.date_sel);  // bottom-left row: 0 month, 1 weekday
             j.field("rot_sun", panel_.rot_sun);    // mid-right zone: false UVI+SOLAR, true sun
@@ -1016,11 +1110,12 @@ class EcowittRFSensor : public PollingComponent {
     }
 
     static void serialize_values(BoundedJson &j, const UiState &u) {
-        static const char *const KEYS[UiState::N] = {
+        static const char *const KEYS[] = {
             "t_in", "h_in", "p", "t_out", "h_out", "leaf_wet", "wind_dir", "wind_spd",
             "wind_gust", "rain", "rain_rate", "uv", "solar", "soil_moist", "soil_t",
             "soil_ec", "pm25", "pm10", "co2", "light_cnt", "light_dist", "leak",
-            "batt_v", "cap_v", "max_gust", "wind_avg", "rain_24h", "rain_state"};
+            "batt_v", "cap_v", "max_gust", "wind_avg", "rain_24h", "rain_state", "pm1", "aqi"};
+        static_assert(sizeof(KEYS) / sizeof(KEYS[0]) == UiState::N, "status key coverage");
         for (uint8_t i = 0; i < UiState::N; i++)
             if (u.has(i) && std::isfinite(u.v[i]))
                 j.field(KEYS[i], u.v[i]);
@@ -1129,6 +1224,18 @@ class EcowittRFSensor : public PollingComponent {
             j.end_object();
         }
         j.end_array();
+        j.object("panel");
+        j.field("daily_hilo", pset_.rst_hilo != 0);
+        j.object("schedule");
+        j.field("enabled", panel_options_.schedule.enabled != 0);
+        j.field("on_minute", panel_options_.schedule.on_minute);
+        j.field("off_minute", panel_options_.schedule.off_minute); j.end_object();
+        j.object("rain");
+        j.field("day_hour", panel_options_.rain_day_hour);
+        j.field("week_monday", panel_options_.rain_week_monday != 0);
+        j.field("season_month", panel_options_.rain_season_month);
+        j.field("prefer_piezo", panel_options_.rain_prefer_piezo != 0); j.end_object();
+        j.end_object();
         j.end_object();
     }
 
@@ -1136,8 +1243,16 @@ class EcowittRFSensor : public PollingComponent {
     // the radio, the LCD bus,
     // upload/extra_servers_ or flash.
     void handle_config(AsyncWebServerRequest *req, const std::string &body) {
-        bool ok = json::parse_json(body, [](JsonObject) -> bool {
-            return true;
+        bool ok = json::parse_json(body, [](JsonObject root) -> bool {
+            const auto integer = [](JsonVariant value, int lo, int hi) {
+                return value.isNull() || (value.is<int>() && value.as<int>() >= lo && value.as<int>() <= hi);
+            };
+            JsonObject panel = root["panel"].as<JsonObject>();
+            if (panel.isNull()) return true;
+            JsonObject schedule = panel["schedule"].as<JsonObject>();
+            JsonObject rain = panel["rain"].as<JsonObject>();
+            return integer(schedule["on_minute"],0,1439) && integer(schedule["off_minute"],0,1439) &&
+                   integer(rain["day_hour"],0,23) && integer(rain["season_month"],1,12);
         });
         if (ok) {
             {
@@ -1286,6 +1401,27 @@ class EcowittRFSensor : public PollingComponent {
             // and the moon needs weeks of calendar before every icon combination can be
             // seen once; they are not persisted and reset to auto on reboot.
             if (JsonObject pn = root["panel"].as<JsonObject>()) {
+                PanelOptions options = panel_options_;
+                bool options_changed = false;
+                if (JsonObject schedule = pn["schedule"].as<JsonObject>()) {
+                    if (!schedule["enabled"].isNull()) options.schedule.enabled = schedule["enabled"].as<bool>();
+                    if (!schedule["on_minute"].isNull()) options.schedule.on_minute = schedule["on_minute"].as<int>();
+                    if (!schedule["off_minute"].isNull()) options.schedule.off_minute = schedule["off_minute"].as<int>();
+                    options_changed = true;
+                }
+                if (JsonObject rain = pn["rain"].as<JsonObject>()) {
+                    if (!rain["day_hour"].isNull()) options.rain_day_hour = rain["day_hour"].as<int>();
+                    if (!rain["week_monday"].isNull()) options.rain_week_monday = rain["week_monday"].as<bool>();
+                    if (!rain["season_month"].isNull()) options.rain_season_month = rain["season_month"].as<int>();
+                    if (!rain["prefer_piezo"].isNull()) options.rain_prefer_piezo = rain["prefer_piezo"].as<bool>();
+                    options_changed = true;
+                }
+                if (options_changed && options.valid()) {
+                    panel_options_ = options; save_panel_options();
+                    rain_.set_calendar_policy({options.rain_day_hour, options.rain_week_monday, options.rain_season_month});
+                    select_display_sources(); panel_.fx_redraw = true;
+                }
+                if (!pn["daily_hilo"].isNull()) { pset_.rst_hilo = pn["daily_hilo"].as<bool>(); save_panel(); }
                 if (!pn["key"].isNull())
                     inject_key((uint8_t)pn["key"].as<int>(),
                                pn["kind"].isNull() ? 1 : (uint8_t)pn["kind"].as<int>());
@@ -1365,7 +1501,17 @@ class EcowittRFSensor : public PollingComponent {
         uint8_t valid = 0;                   // bit0 temp, 1 hum, 2 gust, 3 rain-rate
     } mm_;
     bool mm_dirty_ = false;
+    uint32_t mm_save_ms_ = 0;
     DisplayHistory history_;
+    ChannelHistory channel_history_;
+    PanelOptions panel_options_;
+    PanelHotspot panel_hotspot_;
+    ConsolePower console_power_;
+    RainConsoleTotal rain_console_total_;
+    BacklightPolicy backlight_policy_;
+    AlarmState alarm_;
+    bool dc_power_ = true;
+    uint32_t power_poll_ms_ = 0;
     bool history_dirty_ = false;
     uint32_t history_save_ms_ = 0;
 
@@ -1375,21 +1521,16 @@ class EcowittRFSensor : public PollingComponent {
     uint8_t key_q_head_ = 0, key_q_len_ = 0;
     std::string panel_mode_last_;
 
-    // Pressure-trend reference ring (see ptrend_tick / draw_pressure_trend).
-    float ptrend_ring_[4] = {0, 0, 0, 0};
-    float ptrend_ref_ = 0;
-    uint32_t ptrend_last_ms_ = 0;
-    uint8_t ptrend_head_ = 0, ptrend_fill_ = 0;
-    bool ptrend_valid_ = false;
-    uint32_t mm_save_ms_ = 0;
-
-    // Clock alarm (stock mode 7): 120 s ring, LIGHT snoozes 10 min, any key silences.
-    bool alarm_ringing_ = false;
-    uint32_t alarm_ring_ms_ = 0;
-    uint32_t alarm_snooze_until_ = 0;
+    ForecastHistory forecast_history_;
+    bool forecast_dirty_ = false;
+    uint32_t forecast_save_ms_ = 0;
+    static constexpr uint8_t FC_NONE = 0xff;
+    uint8_t fc_override_ = FC_NONE;
     bool buzzer_on_ = false;
-    uint32_t beep_off_ms_ = 0;               // key-beep pulse end
-    uint32_t last_beep_ms_ = 0;              // alarm cadence timer
+    uint32_t beep_off_ms_ = 0;
+    bool key_beep_active_ = false;
+    uint8_t applied_backlight_ = 0xff;
+    bool press_started_dark_ = false;
 
     float disp_temp(float c) const { return pset_.unit_temp ? c * 9.0f / 5.0f + 32.0f : c; }
     float disp_wind(float ms) const {
@@ -1444,7 +1585,7 @@ class EcowittRFSensor : public PollingComponent {
     // which decode to the same family) carries a channel number here.
     int16_t ext_chan_slot(uint8_t ch) const {
         for (size_t i = 0; i < roster_count_; i++)
-            if (roster_[i].family == Family::WH31 && roster_[i].channel == ch &&
+            if (roster_[i].family == Family::WH31 && roster_[i].accepted && roster_[i].channel == ch &&
                 roster_[i].last_ms != 0 && family_enabled(Family::WH31) &&
                 !is_disabled((uint8_t)Family::WH31, roster_[i].id) &&
                 millis() - roster_[i].last_ms <= ROSTER_SEEN_WINDOW_MS)
@@ -1460,97 +1601,32 @@ class EcowittRFSensor : public PollingComponent {
         return false;
     }
 
-    void ptrend_tick() {
-        if (!ui_.has(UiState::P)) return;
-        uint32_t now = millis();
-        if (ptrend_last_ms_ != 0 && now - ptrend_last_ms_ < 3600000UL) return;
-        ptrend_last_ms_ = now;
-        ptrend_ring_[ptrend_head_] = ui_.v[UiState::P];
-        ptrend_head_ = (uint8_t)((ptrend_head_ + 1) % 4);
-        if (ptrend_fill_ < 4) ptrend_fill_++;
-        if (ptrend_fill_ >= 4) {           // oldest slot is 3 samples (~3 h) back
-            ptrend_ref_ = ptrend_ring_[ptrend_head_];
-            ptrend_valid_ = true;
-        }
+    uint32_t panel_unix_time() const {
+        if (time_clock == nullptr) return 0;
+        const ESPTime t = time_clock->utcnow();
+        return panel_clock_valid(t) ? (uint32_t)t.timestamp : 0;
     }
-
-    static constexpr uint16_t FC_HOURS = 72;   // hourly ring depth (3 days)
-    static constexpr uint8_t FC_WARM = 3;      // hours of history before the first verdict
-    static constexpr uint8_t FC_SHORT = 12;    // hours in the short-term mean
-    static constexpr uint8_t FC_NONE = 0xff;   // stock's "no change" / invalid sentinel
-
-    int16_t fc_hourly_[FC_HOURS] = {0};   // pressure in 0.1 hPa, [0] = newest
-    uint16_t fc_fill_ = 0;          // valid entries in fc_hourly_
-    uint32_t fc_hour_ms_ = 0;
-    int16_t fc_ten_[6] = {0, 0, 0, 0, 0, 0};   // 10-minute ring for the storm test
-    uint8_t fc_ten_fill_ = 0;
-    uint32_t fc_ten_ms_ = 0;
-    uint8_t fc_state_ = FC_NONE;    // 0..6, or FC_NONE while warming up
-    uint8_t fc_override_ = FC_NONE; // bench override via POST /config {"panel":{"fc":n}}
-
-    static int16_t mean16(const int16_t *v, uint16_t n) {
-        int32_t sum = 0;
-        for (uint16_t i = 0; i < n; i++) sum += v[i];
-        return (int16_t)(sum / (int32_t)n);
+    float forecast_outdoor_temp() const { return ui_.has(UiState::T_OUT) ? ui_.v[UiState::T_OUT] : NAN; }
+    void pressure_observed(float p) {
+        forecast_dirty_ |= forecast_history_.sample(p, panel_unix_time());
     }
-
-    // One 10-minute and one hourly pressure sample, then re-run the classifier. Called
-    // from update() (16 s tick), so the intervals are checked, not assumed.
     void forecast_tick() {
-        if (!ui_.has(UiState::P)) return;
-        uint32_t now = millis();
-        int16_t p10 = (int16_t)lroundf(ui_.v[UiState::P] * 10.0f);
-
-        if (fc_ten_ms_ == 0 || now - fc_ten_ms_ >= 600000UL) {
-            fc_ten_ms_ = now;
-            for (uint8_t i = 5; i > 0; i--) fc_ten_[i] = fc_ten_[i - 1];
-            fc_ten_[0] = p10;
-            if (fc_ten_fill_ < 6) fc_ten_fill_++;
-        }
-        if (fc_hour_ms_ != 0 && now - fc_hour_ms_ < 3600000UL) return;
-        fc_hour_ms_ = now;
-        for (uint16_t i = FC_HOURS - 1; i > 0; i--) fc_hourly_[i] = fc_hourly_[i - 1];
-        fc_hourly_[0] = p10;
-        if (fc_fill_ < FC_HOURS) fc_fill_++;
-        if (fc_fill_ < FC_WARM) return;
-
-        if (fc_ten_fill_ == 6 && fc_fill_ >= FC_SHORT) {
-            int16_t lo_recent = fc_ten_[0], lo_long = fc_hourly_[0];
-            for (uint8_t i = 1; i < 6; i++)
-                if (fc_ten_[i] < lo_recent) lo_recent = fc_ten_[i];
-            for (uint16_t i = 1; i < fc_fill_; i++)
-                if (fc_hourly_[i] < lo_long) lo_long = fc_hourly_[i];
-            if ((int32_t)lo_recent - (int32_t)lo_long < -39) {
-                fc_state_ = 5;
-                fc_snow_promote();
-                return;
-            }
-        }
-
-        uint16_t n_short = fc_fill_ < FC_SHORT ? fc_fill_ : FC_SHORT;
-        int32_t d = (int32_t)mean16(fc_hourly_, n_short) - (int32_t)mean16(fc_hourly_, fc_fill_);
-        uint8_t st = FC_NONE;
-        if (d > 49) st = 0;
-        else if (d > 45) st = FC_NONE;
-        else if (d > 4) st = 1;
-        else if (d >= 0) st = FC_NONE;
-        else if (d >= -30) st = 2;
-        else if (d >= -34) st = FC_NONE;
-        else st = 3;
-        if (st != FC_NONE) fc_state_ = st;
-        fc_snow_promote();
+        if (forecast_dirty_ && millis() - forecast_save_ms_ >= 3600000UL) save_forecast();
     }
-
-    void fc_snow_promote() {
-        if (fc_state_ != 3 && fc_state_ != 5) return;
-        if (ui_.has(UiState::T_OUT) && ui_.v[UiState::T_OUT] <= 0.0f) fc_state_++;
+    void save_forecast() {
+        if (!forecast_dirty_) return;
+        forecast_history_.seal();
+        if (forecast_pref_.save(&forecast_history_)) {
+            global_preferences->sync();
+            forecast_dirty_ = false; forecast_save_ms_ = millis();
+        }
     }
 
     uint8_t moon_phase() const {
         if (moon_override_ < 8) return moon_override_;
         if (time_clock == nullptr) return 0xff;
         ESPTime t = time_clock->utcnow();
-        if (!t.is_valid()) return 0xff;
+        if (!panel_clock_valid(t)) return 0xff;
         double days = ((double)t.timestamp - 947182440.0) / 86400.0;   // since that new moon
         double frac = days / 29.530588853;
         frac -= floor(frac);
@@ -1566,7 +1642,7 @@ class EcowittRFSensor : public PollingComponent {
     bool sun_event(bool rising, uint8_t &hh, uint8_t &mm) const {
         if (sun_ == nullptr || time_clock == nullptr) return false;
         ESPTime today = time_clock->utcnow();
-        if (!today.is_valid()) return false;
+        if (!panel_clock_valid(today)) return false;
         today.hour = today.minute = today.second = 0;
         today.recalc_timestamp_utc();
         optional<ESPTime> e = rising ? sun_->sunrise(today, -0.83333) : sun_->sunset(today, -0.83333);
@@ -1618,7 +1694,7 @@ class EcowittRFSensor : public PollingComponent {
             else if (r.humidity > mm_.h_max) { mm_.h_max = r.humidity; mm_dirty_ = true; }
             else if (r.humidity < mm_.h_min) { mm_.h_min = r.humidity; mm_dirty_ = true; }
         }
-        if (array_primary && r.has(F_GUST) && (!(mm_.valid & 4) || r.gust_mps > mm_.gust_max)) {
+        if ((((uint32_t)r.family << 24) | (r.id & 0xffffff)) == primary_array_key_ && r.has(F_GUST) && (!(mm_.valid & 4) || r.gust_mps > mm_.gust_max)) {
             mm_.gust_max = r.gust_mps; mm_.valid |= 4; mm_dirty_ = true;
         }
         if (rain_primary && r.rain_rate_mmh > 0 && (!(mm_.valid & 8) || r.rain_rate_mmh > mm_.rrate_max)) {
@@ -1648,13 +1724,10 @@ class EcowittRFSensor : public PollingComponent {
             if (r.has(F_TEMP) && r.has(F_HUM)) add(H::DEW, dew_point_c(r.temp_c, r.humidity));
             if (r.has(F_TEMP)) {
                 const bool humidity_ok = r.temp_c <= 26.7f || r.has(F_HUM);
-                const bool wind_ok = r.temp_c >= 10.0f || r.has(F_WIND);
-                if (humidity_ok && wind_ok) add(H::FEELS, feels_like_c(r.temp_c, r.humidity, r.wind_mps));
+                const bool wind_ok = r.temp_c >= 10.0f || ui_.has(UiState::WSPD);
+                if (humidity_ok && wind_ok) add(H::FEELS, feels_like_c(r.temp_c, r.humidity,
+                    ui_.has(UiState::WSPD) ? ui_.v[UiState::WSPD] : 0));
             }
-            if (r.has(F_WIND)) add(H::WIND, r.wind_mps);
-            if (r.has(F_GUST)) add(H::GUST, r.gust_mps);
-            if (r.has(F_UV)) add(H::UV, r.uv);
-            if (r.has(F_LIGHT)) add(H::SOLAR, r.light_wm2);
         }
         if (rain) add(H::RAIN_RATE, r.rain_rate_mmh); // finite zero is a real record
         if (history_dirty_ && millis() - history_save_ms_ >= 60000) save_display_history();
@@ -1671,13 +1744,21 @@ class EcowittRFSensor : public PollingComponent {
         const float legacy[6] = {mm_.t_max, mm_.t_min, mm_.h_max, mm_.h_min, mm_.gust_max, mm_.rrate_max};
         history_.legacy_signature = DisplayHistory::signature(legacy, mm_.valid);
         history_pref_.save(&history_);
+        channel_history_pref_.save(&channel_history_);
         global_preferences->sync();
         history_dirty_ = false;
         history_save_ms_ = millis();
     }
 
     void reset_maxmin(bool max_side) {
+        refresh_ext_chans();
+        const uint8_t sel = max_side ? panel_.max_sel : panel_.min_sel;
+        if (sel >= Panel::TEMP_MAIN_N && sel < Panel::TEMP_MAIN_N + ext_chan_n_) {
+            channel_history_.channel[ext_chans_[sel - Panel::TEMP_MAIN_N] - 1].reset(max_side);
+            history_dirty_ = true; save_display_history(); return;
+        }
         history_.reset(max_side);
+        channel_history_.reset(max_side);
         history_dirty_ = true;
         // Re-seed the reset side from the live reading (sentinel if none seen yet) so
         // the opposite side's records survive — temp/hum share one valid bit per pair.
@@ -1788,14 +1869,14 @@ class EcowittRFSensor : public PollingComponent {
     float press_abs_hpa() const { return ui_.v[UiState::P]; }
     float press_rel_hpa() const { return ui_.v[UiState::P] + rel_off_hpa_; }
 
-    // Apply one displayed least-significant unit per key step; clamp REL to 700..1200 hPa.
+    // Apply one displayed least-significant unit per key step; clamp REL to 700..1100 hPa.
     void apply_rel_steps() {
         if (panel_.rel_steps == 0) return;
         float lsb = pset_.unit_press == 1 ? 0.01f * 33.8639f
                   : pset_.unit_press == 2 ? 0.1f * 1.333224f : 0.1f;
         float ab = ui_.has(UiState::P) ? press_abs_hpa() : 1013.25f;
         float rel = ab + rel_off_hpa_ + (float)panel_.rel_steps * lsb;
-        rel = std::clamp(rel, 700.0f, 1200.0f);
+        rel = std::clamp(rel, 700.0f, 1100.0f);
         rel_off_hpa_ = rel - ab;
         upload.rel_offset_hpa = rel_off_hpa_;
         panel_.rel_steps = 0;
@@ -1878,7 +1959,7 @@ class EcowittRFSensor : public PollingComponent {
         uint8_t hh = 0, mm = 0;
         if (time_clock != nullptr) {
             ESPTime t = time_clock->now();
-            if (t.is_valid()) {
+            if (panel_clock_valid(t)) {
                 valid = true;
                 mm = t.minute;
                 hh = t.hour;
@@ -1886,8 +1967,8 @@ class EcowittRFSensor : public PollingComponent {
             }
         }
         seg(fb_, SEG_TIME_DST, valid && dst);
-        seg(fb_, SEG_TIME_BELL, pset_.alarm_on != 0 && (blink || !alarm_ringing_));
-        seg(fb_, SEG_TIME_SNOOZE, alarm_snooze_until_ > millis());
+        seg(fb_, SEG_TIME_BELL, pset_.alarm_on != 0 && (blink || !alarm_.ringing));
+        seg(fb_, SEG_TIME_SNOOZE, alarm_.snoozing);
         if (!valid) {
             seg(fb_, SEG_TIME_PM, false);
             seg(fb_, SEG_TIME_T12, false);
@@ -2052,8 +2133,8 @@ class EcowittRFSensor : public PollingComponent {
         if (rain_.count() && rain_.buckets()[0].last_counter >= 0.0f) {
             const RainAggregator::Bucket &bk = rain_.buckets()[0];
             mm = r == 3 ? bk.day_mm : r == 4 ? bk.week_mm : r == 5 ? bk.month_mm
-                 : r == 6 ? bk.year_mm : bk.last_counter;
-            missing = false;
+                 : r == 6 ? bk.year_mm : rain_console_total_.value();
+            missing = !std::isfinite(mm);
         }
         uint8_t b[6], dec = 0;
         if (missing) {
@@ -2093,28 +2174,73 @@ class EcowittRFSensor : public PollingComponent {
         for (uint8_t i = 0; i < 6; i++) seg(fb_, RAIN_BAR[i], i < n);
     }
 
-    // Eleven-position pointer from the current pressure relative to its moving baseline.
     void draw_pressure_trend() {
-        seg(fb_, SEG_TREND_ZONE, true);
-        seg(fb_, SEG_TREND_AXIS, true);
-        int lvl = -1;   // -1 = reference not established yet -> all 11 dark, like stock
-        if (ui_.has(UiState::P) && ptrend_valid_) {
-            // Ladder edges are stock's, in 0.1 hPa, so compare in hPa regardless of the
-            // display unit the user picked.
-            int32_t d = (int32_t)lroundf((ui_.v[UiState::P] - ptrend_ref_) * 10.0f);
-            lvl = d > 49 ? 0 : d > 39 ? 1 : d > 29 ? 2 : d > 19 ? 3 : d > 9 ? 4
-                  : d >= -9 ? 5 : d < -49 ? 10 : d < -39 ? 9 : d < -29 ? 8 : d < -19 ? 7 : 6;
-        }
-        for (uint8_t i = 0; i < PTREND_N; i++) seg(fb_, BAR22[i], (int)i == lvl);
+        const int8_t level = ui_.has(UiState::P) ? forecast_history_.trend_level(ui_.v[UiState::P], panel_unix_time()) : -1;
+        draw_trend_segments(fb_, level);
     }
 
+    int16_t aq_source_slot() const {
+        int16_t best = -1;
+        const uint32_t now = millis();
+        for (size_t i = 0; i < roster_count_; ++i) {
+            const auto &e = roster_[i];
+            if (!aq_supports_lcd(e.family) || !e.accepted || !e.last_ms || now - e.last_ms > 300000UL ||
+                !family_enabled(e.family) || is_disabled((uint8_t)e.family, e.id)) continue;
+            if (best < 0 || (e.family == Family::WH46 && roster_[best].family != Family::WH46)) best = (int16_t)i;
+        }
+        return best;
+    }
+    int16_t native_aq_source_slot() const {
+        const int16_t combo = aq_source_slot();
+        if (combo >= 0) return combo;
+        int16_t best = -1;
+        for (size_t i = 0; i < roster_count_; ++i) {
+            const auto &e = roster_[i];
+            if ((e.family != Family::WH43 && e.family != Family::WH0290) || !e.accepted ||
+                !e.last_ms || millis() - e.last_ms > 300000UL || !family_enabled(e.family) ||
+                is_disabled((uint8_t)e.family,e.id) || !e.v.has(UiState::PM25)) continue;
+            if (best < 0 || e.id < roster_[best].id) best = (int16_t)i;
+        }
+        return best;
+    }
+    StartupDisplay startup_display_;
+    uint8_t aq_rows_[5] = {0};
+    void refresh_aq_rows() {
+        const int16_t idx = aq_source_slot();
+        uint8_t count = 0;
+        if (idx >= 0) for (uint8_t row = 1; row < (uint8_t)AirQualityRow::COUNT; ++row)
+            if (aq_row_available(row, roster_[idx].v)) aq_rows_[count++] = row;
+        panel_.aq_count = count;
+        if (panel_.aq_sel > count) panel_.aq_sel = 0;
+        startup_display_.tick(millis(), count, panel_.aq_sel, panel_.rot_sun);
+    }
     void draw_batt_channel() {
-        for (uint8_t i = 0; i < 6; i++) seg(fb_, CH_MARK[i], i == 0);
-        seg(fb_, SEG_AQ_BATT, false);
-        seg(fb_, SEG_ROW_DATE, true);
-        seg(fb_, SEG_ROW_AQ, false);
-        seg(fb_, SEG_ROW_AQU, false);
-        draw_date_row();
+        refresh_aq_rows();
+        const int16_t idx = aq_source_slot();
+        const uint8_t row = panel_.aq_sel && idx >= 0 ? aq_rows_[panel_.aq_sel - 1] : 0;
+        draw_aq_captions(fb_, row);
+        if (row == 0) {
+            draw_aq_link(fb_, false, 0, false);
+            draw_date_row();
+            return;
+        }
+        float value = 0;
+        const bool have = aq_row_value(row, roster_[idx].v, value);
+        uint8_t digits[6];
+        if (have) fmt_decimal((int32_t)lroundf(value > 99999 ? 99999 : value), digits);
+        else fmt_dashes(digits);
+        const bool pm = row >= (uint8_t)AirQualityRow::PM1 && row <= (uint8_t)AirQualityRow::PM10;
+        // Exact stock alignment: particulate concentrations use four positions;
+        // CO2/AQI use five. The unused final electrode stays blank in PM mode.
+        const auto character = [](uint8_t d) { return d < 10 ? char('0' + d) : d == SM_MINUS ? '-' : ' '; };
+        big_char(fb_, 0, character(digits[pm ? 3 : 4]));
+        big_char(fb_, 1, character(digits[pm ? 2 : 3]));
+        big_char(fb_, 2, character(digits[pm ? 1 : 2]));
+        draw_small_glyph(fb_, Z0, digits[pm ? 0 : 1]);
+        draw_small_glyph(fb_, Z1, pm ? SM_BLANK : digits[0]);
+        const uint32_t age = (millis() - roster_[idx].last_ms) / 1000;
+        const uint8_t bars = age < 90 ? 4 : age < 300 ? 3 : age < 900 ? 2 : age < 3600 ? 1 : 0;
+        draw_aq_link(fb_, true, bars, roster_[idx].battery_low);
     }
 
     // Three fourteen-segment letters, then two day-of-month digits; no leading-zero blanking.
@@ -2123,7 +2249,7 @@ class EcowittRFSensor : public PollingComponent {
         ESPTime t{};
         if (time_clock != nullptr) {
             t = time_clock->now();
-            ok = t.is_valid();
+            ok = panel_clock_valid(t);
         }
         if (!ok) {
             big_text(fb_, "---");
@@ -2153,24 +2279,18 @@ class EcowittRFSensor : public PollingComponent {
         for (uint8_t i = 0; i < 4; i++) seg(fb_, tab[i], ((mask >> i) & 1) != 0);
     }
 
-    // Forecast states 0..4 compose fixed weather icons. States 5/6 flash rain/snow;
-    // unknown states, including warm-up, leave the box dark.
     void draw_forecast(bool blink) {
-        uint8_t st = (fc_override_ != FC_NONE) ? fc_override_ : fc_state_;
-        if (st == 5 || st == 6) st = blink ? (uint8_t)(st - 2) : FC_NONE;
-        seg(fb_, SEG_FC_SUN, st < 2);
-        seg(fb_, SEG_FC_CLOUD, st >= 1 && st <= 4);
-        seg(fb_, SEG_FC_RAIN, st == 3);
-        seg(fb_, SEG_FC_SNOW, st == 4);
+        const uint8_t state = fc_override_ == FC_NONE ? forecast_history_.forecast_state(forecast_outdoor_temp()) : fc_override_;
+        draw_forecast_segments(fb_, state, blink);
     }
 
+    WifiIndicator wifi_indicator_;
     void draw_wifi_icon() {
-        uint8_t lvl = 0;
-        if (wifi::global_wifi_component != nullptr &&
-            wifi::global_wifi_component->is_connected()) {
-            int r = wifi::global_wifi_component->wifi_rssi();
-            lvl = r >= -55 ? 4 : r >= -67 ? 3 : r >= -78 ? 2 : 1;
-        }
+        auto *w = wifi::global_wifi_component;
+        const bool connected = w && w->is_connected();
+        const bool ap = panel_hotspot_.active() || (w && w->is_ap_active());
+        const uint8_t lvl = wifi_indicator_.level(millis(), connected, ap,
+            connected ? w->wifi_rssi() : -100, http_success_count().load(std::memory_order_relaxed));
         for (uint8_t i = 0; i < 4; i++) seg(fb_, WIFI_BARS[i], i < lvl);
     }
 
@@ -2180,7 +2300,7 @@ class EcowittRFSensor : public PollingComponent {
                            ? ((roster_[ext_slot].last_ms == 0)
                                   ? 0xffffffffu
                                   : (millis() - roster_[ext_slot].last_ms) / 1000)
-                           : outdoor_age_s();
+                           : source_age_s(primary_th_key_);
         uint8_t lvl = age == 0xffffffffu ? 0
                       : age < 90 ? 4 : age < 300 ? 3 : age < 900 ? 2 : age < 3600 ? 1 : 0;
         seg(fb_, SEG_RF_ANT, age != 0xffffffffu);
@@ -2329,7 +2449,8 @@ class EcowittRFSensor : public PollingComponent {
     // Stock reads one fixed sensor slot per zone; the roster search is our equivalent.
     bool field_batt_low(uint8_t f1, uint8_t f2 = 0xff) const {
         const bool rain = f1 == UiState::RAIN_RATE || f1 == UiState::RAIN;
-        const uint32_t key = rain ? primary_rain_key_ : primary_array_key_;
+        const bool th = f1 == UiState::T_OUT || f1 == UiState::H_OUT;
+        const uint32_t key = rain ? primary_rain_key_ : th ? primary_th_key_ : primary_array_key_;
         const uint32_t now = millis();
         for (size_t i = 0; i < roster_count_; i++) {
             const auto &e = roster_[i];
@@ -2373,17 +2494,17 @@ class EcowittRFSensor : public PollingComponent {
                      : src.has(UiState::H_IN) ? src.v[UiState::H_IN] : 0;
             float w = ui_.has(UiState::WSPD) ? ui_.v[UiState::WSPD] : 0;
             float v = t;
-            bool need_h = false;   // the variant is undefined without a humidity
+            bool need_h = false, need_wind = false;
             if (!on_ext) {
                 switch (sel) {
-                    case 1: v = feels_like_c(t, rh, w); need_h = t > 26.7f; break;
+                    case 1: v = feels_like_c(t, rh, w); need_h = t > 26.7f; need_wind = t < 10.0f; break;
                     case 2: v = dew_point_c(t, rh); need_h = true; break;
                     default: break;
                 }
             }
             // No humidity -> dashes rather than a dew point / heat index invented from an
             // assumed 50 %.
-            bool missing = !have_t || (need_h && !have_h) || std::isnan(v);
+            bool missing = !have_t || (need_h && !have_h) || (need_wind && !ui_.has(UiState::WSPD)) || std::isnan(v);
             int32_t v10 = 0;
             if (!missing) fmt_x10(disp_temp(v), v10);
             draw_outdoor_temp(v10, missing);
@@ -2391,7 +2512,7 @@ class EcowittRFSensor : public PollingComponent {
         }
 
         seg(fb_, SEG_CHAN_TICK, true);
-        seg(fb_, SEG_CHAN_ARROW, false);   // existing CH label/number are sufficient; physical mapping verified
+        seg(fb_, SEG_CONSOLE_BATT, console_power_.known() && console_power_.low());
 
         {
             int32_t v10 = 0;
@@ -2430,15 +2551,29 @@ class EcowittRFSensor : public PollingComponent {
     void render_maxmin(bool maximum) {
         using H = DisplayHistory;
         big_text(fb_, maximum ? ROWTXT_MAX : ROWTXT_MIN);
+        refresh_ext_chans();
         const uint8_t sel = maximum ? panel_.max_sel : panel_.min_sel;
+        const bool on_ext = sel >= Panel::TEMP_MAIN_N && sel < Panel::TEMP_MAIN_N + ext_chan_n_;
         const H::Field tf = sel == 1 ? H::FEELS : sel == 2 ? H::DEW : H::TEMP;
         const auto have = [this, maximum](H::Field f) { return history_.has(f, maximum); };
         const auto value = [this, maximum](H::Field f) { return history_.get(f, maximum); };
-        seg(fb_, SEG_OUT_LABEL, true);
-        seg(fb_, SEG_OUT_FEELS, sel == 1);
-        seg(fb_, SEG_OUT_DEW, sel == 2);
-        draw_outdoor_temp(have(tf) ? (int32_t)lroundf(disp_temp(value(tf)) * 10) : 0, !have(tf));
-        draw_outdoor_hum(have(H::HUM) ? (int32_t)lroundf(value(H::HUM)) : 0, !have(H::HUM));
+        seg(fb_, SEG_OUT_LABEL, !on_ext);
+        seg(fb_, SEG_OUT_FEELS, !on_ext && sel == 1);
+        seg(fb_, SEG_OUT_DEW, !on_ext && sel == 2);
+        seg(fb_, SEG_OUT_FLAG, on_ext);
+        draw_small_glyph(fb_, OT_CHAN, on_ext ? ext_chans_[sel - Panel::TEMP_MAIN_N] : SM_BLANK);
+        if (on_ext) {
+            const auto &r = channel_history_.channel[ext_chans_[sel - Panel::TEMP_MAIN_N] - 1];
+            const int16_t slot = ext_chan_slot(ext_chans_[sel - Panel::TEMP_MAIN_N]);
+            const bool same_source = slot >= 0 && r.key == (((uint32_t)roster_[slot].family << 24) | (roster_[slot].id & 0xffffff));
+            const uint8_t tv = maximum ? 2 : 1, hv = maximum ? 8 : 4;
+            const float t = maximum ? r.t_max : r.t_min, h = maximum ? r.h_max : r.h_min;
+            draw_outdoor_temp((int32_t)lroundf(disp_temp(t) * 10), !same_source || !(r.valid & tv));
+            draw_outdoor_hum((int32_t)lroundf(h), !same_source || !(r.valid & hv));
+        } else {
+            draw_outdoor_temp(have(tf) ? (int32_t)lroundf(disp_temp(value(tf)) * 10) : 0, !have(tf));
+            draw_outdoor_hum(have(H::HUM) ? (int32_t)lroundf(value(H::HUM)) : 0, !have(H::HUM));
+        }
         seg(fb_, SEG_CHAN_TICK, true);
         draw_indoor_temp(have(H::IN_TEMP) ? (int32_t)lroundf(disp_temp(value(H::IN_TEMP)) * 10) : 0,
                          !have(H::IN_TEMP));
@@ -2518,9 +2653,10 @@ class EcowittRFSensor : public PollingComponent {
     }
 
     // Each settings step highlights its corresponding display zone.
-    // Clock/date values are read-only here because SNTP owns time.
+    // The edit engine updates local clock fields; the display follows the manual order.
     void render_setting() {
-        uint8_t st = panel_.setting_step;
+        static constexpr uint8_t DISPLAY_STEP[16] = {0,2,3,4,5,6,7,8,9,10,11,12,13,14,1,15};
+        const uint8_t st = DISPLAY_STEP[panel_.setting_step & 15];
         bool vis = blink_vis();
         switch (st) {
             case 0:
@@ -2549,7 +2685,7 @@ class EcowittRFSensor : public PollingComponent {
             }
             case 3: case 4: case 5: case 6: case 7: {
                 ESPTime t{};
-                bool ok = time_clock != nullptr && (t = time_clock->now()).is_valid();
+                bool ok = time_clock != nullptr && panel_clock_valid(t = time_clock->now());
                 if (!ok) {
                     draw_small_glyph(fb_, TA, SM_MINUS);
                     draw_small_glyph(fb_, TB, SM_MINUS);
@@ -2624,8 +2760,8 @@ class EcowittRFSensor : public PollingComponent {
     bool test_fb_on_ = false;
 
     void render_panel() {
-        render_phase_ = millis() / 500;
-        blink_on_ = (render_phase_ & 1) == 0;
+        render_phase_ = millis() / 250;
+        blink_on_ = (millis() / 500 & 1) == 0;
         if (!gpl_ok_)
             return;
         if (test_fb_on_) {
@@ -2651,7 +2787,7 @@ class EcowittRFSensor : public PollingComponent {
     // True once the 0.5 s blink phase has moved on since the last paint: the colon, the
     // storm forecast, a ringing bell and every setting/alarm field blink on it. A paint is
     // a 64-byte I2C burst, so 2 Hz costs nothing.
-    bool render_due() const { return last_render_ms_ == 0 || millis() / 500 != render_phase_; }
+    bool render_due() const { return last_render_ms_ == 0 || millis() / 250 != render_phase_; }
 
     // ---- segment-walk diagnostic (owns the panel while walk_active_) ----
     // One segment lit at a time, in framebuffer order: step i = byte i>>3, bit 1<<(i&7),
@@ -2697,97 +2833,164 @@ class EcowittRFSensor : public PollingComponent {
         }
     }
 
-    // ---- panel event side effects (called from loop) ----
+    // Panel effects run on the same loop that owns the LCD/radio bus and preferences.
+    bool snooze_hold_consumed_ = false;
     void handle_panel_event(const PanelEvent &ev) {
-        if (alarm_ringing_) {
-            alarm_ringing_ = false;
-            gpl_buzzer(false);
-            buzzer_on_ = false;
-            if (ev.btn == Btn::LIGHT && ev.kind == EvKind::SHORT) {
-                alarm_snooze_until_ = millis() + 600000UL;
-                ESP_LOGI(TAG, "alarm snoozed 10 min");
-                return;  // LIGHT consumed by snooze
-            }
-            ESP_LOGI(TAG, "alarm silenced by key");
-            return;  // Stock: key consumed by silencing alarm (no mode jump)
-        } else if (ev.kind == EvKind::LONG && alarm_snooze_until_ > millis()) {
-            alarm_snooze_until_ = 0;  // hold any button 2 s while snoozed -> exit snooze
-            ESP_LOGI(TAG, "alarm snooze cancelled");
-            return;  // Consumed by snooze cancel
+        if (snooze_hold_consumed_ && panel_.raw) return;
+        if (panel_.mode == DMode::NORMAL) {
+            if (ev.btn == Btn::INC && ev.kind == EvKind::SHORT) startup_display_.aq_manual = true;
+            if (ev.btn == Btn::DOWN && ev.kind == EvKind::LONG) startup_display_.sun_manual = true;
         }
-        panel_.handle(ev);
-        if (panel_.fx_beep && pset_.beep) {
-            gpl_buzzer(true);
-            buzzer_on_ = true;
-            beep_off_ms_ = millis() + 60;
+        backlight_policy_.activity(millis());
+        if (alarm_.press(millis(), ev.btn == Btn::LIGHT && ev.kind == EvKind::SHORT)) return;
+        if ((ev.kind == EvKind::LONG || ev.kind == EvKind::XLONG || ev.kind == EvKind::CHORD_WIFI) && alarm_.cancel_snooze()) {
+            if (panel_.raw) { snooze_hold_consumed_ = true; panel_.long_fired = panel_.xlong_fired = true; }
+            panel_.fx_redraw = true;
+            return;
         }
+        if (ev.btn == Btn::LIGHT && ev.kind == EvKind::SHORT && !dc_power_ &&
+            press_started_dark_ && panel_.mode == DMode::NORMAL) {
+            panel_.fx_beep = true; panel_.fx_redraw = true;
+        } else panel_.handle(ev);
+        if (panel_.fx_beep && pset_.beep) { beep_off_ms_ = millis() + 60; key_beep_active_ = true; }
     }
-
     void apply_panel_fx() {
         if (panel_.fx_reset_max) reset_maxmin(true);
         if (panel_.fx_reset_min) reset_maxmin(false);
-        if (panel_.fx_backlight) gpl_backlight_level(pset_.backlight);
+        if (panel_.fx_backlight) backlight_policy_.manual_level(millis(), pset_.backlight);
         if (panel_.fx_settings) save_panel();
         if (panel_.fx_rel) apply_rel_steps();
-        if (panel_.fx_reregister) {
-            ESP_LOGW(TAG, "TEMP hold (2s/5s): RF sensor search/re-register requested (roster auto-learns; log-only stub)");
-        }
-        if (panel_.fx_wifi_hotspot) {
-            ESP_LOGW(TAG, "TEMP+- chord (2s): Wi-Fi hotspot / config mode requested");
-#ifdef USE_CAPTIVE_PORTAL
-            if (captive_portal::global_captive_portal != nullptr) {
-                ESP_LOGI(TAG, "Starting captive portal AP for Wi-Fi config");
-                captive_portal::global_captive_portal->start();
-            }
-#endif
-        }
-        if (panel_.fx_factory_reset) {
-            // Guardrail: the SET+LIGHT 5 s factory-reset chord MUST stay a LOG-ONLY STUB.
-            // DO NOT wipe panel settings, records, or flash preferences. On custom ESPHome
-            // firmware a wipe of settings or NVS could sever Wi-Fi/HA connectivity or lose
-            // calibration, so this is logged only.
-            ESP_LOGW(TAG, "SET+LIGHT 5s chord: Factory reset requested (log-only stub per safety guardrails; no config wipe)");
-        }
+        if (panel_.fx_clock) apply_panel_clock();
+        if (panel_.fx_reregister) reregister_selected();
+        if (panel_.fx_wifi_hotspot) start_panel_hotspot();
+        if (panel_.fx_factory_reset) factory_reset_application();
+        power_tick(panel_.fx_backlight);
     }
-
-    // Buzzer housekeeping: end the 60 ms key beep; alarm cadence (2 Hz toggle, 120 s).
+    void reregister_selected() {
+        refresh_ext_chans();
+        const bool all = panel_.reregister_mode == 2;
+        const uint8_t channel = panel_.reregister_mode == 1 && panel_.reregister_index < ext_chan_n_
+            ? ext_chans_[panel_.reregister_index] : 0;
+        const uint32_t main_key = primary_th_key_;
+        for (size_t i = 0; i < roster_count_;) {
+            const auto &e = roster_[i];
+            const uint32_t key = ((uint32_t)e.family << 24) | (e.id & 0xffffff);
+            const bool matches = e.family != Family::Builtin &&
+                ((all && (e.family == Family::WH31 || key == main_key)) ||
+                 (channel && e.family == Family::WH31 && e.channel == channel) ||
+                 (!channel && !all && key == main_key));
+            if (matches) { for (size_t j = i + 1; j < roster_count_; ++j) roster_[j - 1] = roster_[j]; --roster_count_; }
+            else ++i;
+        }
+        if (all) channel_history_ = ChannelHistory{};
+        else if (channel) channel_history_.forget(channel);
+        if (all || !channel) {
+            for (DisplayHistory::Field f : {DisplayHistory::TEMP,DisplayHistory::HUM,DisplayHistory::FEELS,DisplayHistory::DEW}) {
+                history_.valid_min &= ~(1u << f); history_.valid_max &= ~(1u << f);
+            }
+            mm_.t_max = -1000; mm_.t_min = 1000; mm_.h_max = -1; mm_.h_min = 101; mm_.valid &= ~3u;
+            save_maxmin();
+        }
+        history_dirty_ = true; save_display_history();
+        select_display_sources(); refresh_selected_values(); refresh_ext_chans();
+        // RF reception is already continuous: deleting accepted registration state
+        // requires two fresh valid reports before a replacement is trusted.
+        panel_.temp_sel = 0; panel_.temp_auto = all;
+        panel_.fx_redraw = true;
+    }
+    void factory_reset_application() {
+        // Compiled transport identity stays recoverable; only application settings
+        // and histories return to defaults. Never erase the global ESPHome NVS.
+        const DeviceConfig cfg{}; const RainPersist rain{}; const DisabledList disabled{};
+        const PanelSettings panel{}; const PanelOptions options{}; const MaxMin extrema{};
+        DisplayHistory history{}; ForecastHistory forecast{}; forecast.seal();
+        const ChannelHistory channels{}; const RainCheckpoint windows{};
+        const RainTotalCheckpoint total{}; const ServerKeys keys{};
+        uint8_t servers[SERVERS_BLOB]{}; const uint32_t zero = 0; const float offset = 0;
+        const bool saved = reset_application_preferences([&](uint32_t key) {
+            switch (key) {
+                case PREF_CFG: return cfg_pref_.save(&cfg);
+                case PREF_RAIN: return rain_pref_.save(&rain);
+                case PREF_SERVERS: return servers_pref_.save(&servers);
+                case PREF_DISABLED: return disabled_pref_.save(&disabled);
+                case PREF_PANEL: return panel_pref_.save(&panel);
+                case PREF_MAXMIN: return maxmin_pref_.save(&extrema);
+                case PREF_RAIN_EVT: return rain_evt_pref_.save(&zero);
+                case PREF_SRV_KEYS: return srv_keys_pref_.save(&keys);
+                case PREF_PANEL_REL: return rel_pref_.save(&offset);
+                case PREF_RAIN_WINDOWS: return rain_windows_pref_.save(&windows);
+                case PREF_DISPLAY_HISTORY: return history_pref_.save(&history);
+                case PREF_FORECAST: return forecast_pref_.save(&forecast);
+                case PREF_PANEL_OPTIONS: return panel_options_pref_.save(&options);
+                case PREF_RAIN_TOTAL: return rain_total_pref_.save(&total);
+                case PREF_CHANNEL_HISTORY: return channel_history_pref_.save(&channels);
+                default: return false;
+            }
+        }, [] { return global_preferences->sync(); });
+        if (saved) {
+            // Prevent shutdown flushes from writing the pre-reset histories back.
+            rain_restore_pending_ = false; rain_.reset(); mm_dirty_ = history_dirty_ = forecast_dirty_ = false;
+            App.safe_reboot();
+        } else ESP_LOGW(TAG, "Application reset could not be saved; reboot cancelled");
+    }
+    void start_panel_hotspot() {
+        panel_hotspot_.start(millis());
+        panel_.fx_redraw = true;
+    }
+    void apply_panel_clock() {
+        ESPTime t = time_clock ? time_clock->now() : ESPTime{};
+        PanelClockValue value;
+        if (panel_clock_valid(t)) value = {t.year, t.month, t.day_of_month, t.hour, t.minute, t.second};
+        if (!apply_clock_delta(value, panel_.clock_field, panel_.clock_delta)) return;
+        std::tm calendar{};
+        calendar.tm_year = value.year - 1900; calendar.tm_mon = value.month - 1;
+        calendar.tm_mday = value.day; calendar.tm_hour = value.hour;
+        calendar.tm_min = value.minute; calendar.tm_sec = value.second; calendar.tm_isdst = -1;
+        const time_t epoch = mktime(&calendar);
+        if (epoch < 0) return;
+        struct timeval tv{epoch, 0};
+        if (settimeofday(&tv, nullptr) == 0) panel_.fx_redraw = true;
+    }
+    void power_tick(bool force = false) {
+        const uint32_t now = millis();
+        if (!gpl_ok_ || (!force && now - power_poll_ms_ < 250)) return;
+        power_poll_ms_ = now;
+        dc_power_ = (gpl_read_reg(3) & 2) != 0;
+        console_power_.sample(now);
+        ESPTime t = time_clock ? time_clock->now() : ESPTime{};
+        const uint8_t previous = pset_.backlight;
+        const uint8_t level = backlight_policy_.tick(now, dc_power_, pset_.backlight,
+            panel_options_.schedule, panel_clock_valid(t), t.hour * 60 + t.minute);
+        panel_.dc_power = dc_power_;
+        panel_.backlight_lit = level != 0;
+        if (previous != pset_.backlight) save_panel();
+        if (level != applied_backlight_) { gpl_backlight_level(level); applied_backlight_ = level; }
+    }
     void buzzer_tick() {
-        uint32_t now = millis();
-        if (buzzer_on_ && !alarm_ringing_ && (int32_t)(now - beep_off_ms_) >= 0) {
-            gpl_buzzer(false);
-            buzzer_on_ = false;
-        }
-        if (alarm_ringing_) {
-            if (now - alarm_ring_ms_ > 120000UL) {  // 120 s ring timeout (stock)
-                alarm_ringing_ = false;
-                gpl_buzzer(false);
-                buzzer_on_ = false;
-                return;
-            }
-            if (now - last_beep_ms_ >= 250) {  // 2 Hz; stock escalates 1->2->4->cont.
-                last_beep_ms_ = now;
-                buzzer_on_ = !buzzer_on_;
-                gpl_buzzer(buzzer_on_);
-            }
-        }
+        const uint32_t now = millis();
+        if (key_beep_active_ && (int32_t)(now - beep_off_ms_) >= 0) key_beep_active_ = false;
+        const bool wanted = alarm_.buzzer(now) || key_beep_active_;
+        if (wanted != buzzer_on_) { buzzer_on_ = wanted; gpl_buzzer(wanted); }
     }
-
-    // Clock alarm trigger: armed && HH:MM match && not snoozed && not already ringing.
     void alarm_tick() {
-        if (!pset_.alarm_on || alarm_ringing_ || time_clock == nullptr)
-            return;
-        uint32_t now = millis();
-        if (now < alarm_snooze_until_)
-            return;
-        ESPTime t = time_clock->now();
-        if (!t.is_valid() || t.hour != pset_.alarm_h || t.minute != pset_.alarm_m)
-            return;
-        if (now - alarm_ring_ms_ < 90000UL)  // once per minute at most
-            return;
-        alarm_ringing_ = true;
-        alarm_ring_ms_ = now;
-        last_beep_ms_ = 0;
-        ESP_LOGI(TAG, "clock alarm ringing (%02d:%02d)", pset_.alarm_h, pset_.alarm_m);
+        const ESPTime t = time_clock ? time_clock->now() : ESPTime{};
+        const int64_t key = ((((int64_t)t.year * 13 + t.month) * 32 + t.day_of_month) * 24 + t.hour) * 60 + t.minute;
+        alarm_.tick(millis(), pset_.alarm_on != 0, panel_clock_valid(t), key,
+                    t.hour == pset_.alarm_h && t.minute == pset_.alarm_m);
+    }
+    void save_panel_options() { panel_options_pref_.save(&panel_options_); global_preferences->sync(); }
+    void daily_history_tick() {
+        const ESPTime t = time_clock ? time_clock->now() : ESPTime{};
+        if (!panel_clock_valid(t)) return;
+        const uint32_t date = (uint32_t)t.year * 10000 + t.month * 100 + t.day_of_month;
+        if (!panel_options_.hilo_date || date > panel_options_.hilo_date) {
+            if (panel_options_.hilo_date && pset_.rst_hilo) {
+                mm_ = MaxMin{}; history_ = DisplayHistory{}; channel_history_ = ChannelHistory{};
+                mm_dirty_ = history_dirty_ = true;
+                save_maxmin(); save_display_history();
+            }
+            panel_options_.hilo_date = date; save_panel_options();
+        }
     }
 
     // Console-local UI settings (units/backlight/clock alarm) + MAX/MIN records.
@@ -2802,7 +3005,7 @@ class EcowittRFSensor : public PollingComponent {
         float off = 0.0f;
         if (rel_pref_.load(&off) && std::isfinite(off) && off > -500.0f && off < 500.0f)
             rel_off_hpa_ = off;
-            upload.rel_offset_hpa = off;
+        upload.rel_offset_hpa = rel_off_hpa_;
         panel_.cfg = &pset_;
     }
     void save_panel() {
@@ -2812,6 +3015,12 @@ class EcowittRFSensor : public PollingComponent {
     void load_maxmin() {
         MaxMin m;
         if (maxmin_pref_.load(&m)) mm_ = m;
+        ChannelHistory channels;
+        if (channel_history_pref_.load(&channels) && channels.valid()) channel_history_ = channels;
+        ForecastHistory forecast;
+        if (forecast_pref_.load(&forecast) && forecast.valid()) forecast_history_ = forecast;
+        PanelOptions options;
+        if (panel_options_pref_.load(&options) && options.valid()) panel_options_ = options;
         DisplayHistory h;
         if (history_pref_.load(&h) && h.valid()) history_ = h;
         const float legacy[6] = {mm_.t_max, mm_.t_min, mm_.h_max, mm_.h_min, mm_.gust_max, mm_.rrate_max};
@@ -2826,10 +3035,15 @@ class EcowittRFSensor : public PollingComponent {
     }
 
     void setup() override {
+        startup_display_.began = millis();
         pinMode(ecowitt_rf::PIN_DOUT, INPUT);
         setup_prefs();
         load_cfg();
         load_servers();
+        load_disabled();
+        load_panel();
+        load_maxmin();
+        rain_.set_calendar_policy({panel_options_.rain_day_hour, panel_options_.rain_week_monday, panel_options_.rain_season_month});
         rain_.set_gain(cfg_.cal_rain);   // BEFORE load_rain: restored counters use this gain
         load_rain();
         if (rain_.count() > 0) {
@@ -2838,9 +3052,12 @@ class EcowittRFSensor : public PollingComponent {
             primary_rain_key_ = rain_.buckets()[0].key;
             primary_rain_ms_ = millis();
         }
-        load_disabled();
-        load_panel();
-        load_maxmin();
+        if (rain_.count()) {
+            RainTotalCheckpoint checkpoint;
+            if (!rain_total_pref_.load(&checkpoint) || !rain_console_total_.restore(checkpoint,
+                rain_.buckets()[0], rain_.calendar_policy(), rain_restore_pending_))
+                rain_console_total_.migrate_legacy(rain_.buckets()[0]);
+        }
         apply_cfg();
         // Push the persisted config back to the 13 template switches (they use
         // restore_mode: DISABLED, so this component is their source of truth).
@@ -2856,6 +3073,8 @@ class EcowittRFSensor : public PollingComponent {
         // GPL811x display init (blank the panel; the stock's LCD bus shares SCLK/DIN
         // with the RF chip, so both CS lines stay high when idle and never overlap here).
         gpl_ok_ = ecowitt_rf::gpl_init();
+        console_power_.begin();
+        if (esp_reset_reason() == ESP_RST_POWERON) pset_.backlight = 2;
         gpl_scratch_ = ecowitt_rf::gpl_dbg_scratch();
         ESP_LOGW(TAG, "GPL811x ready-check: %s (scratch readback 0x%02x, want 0x5a)",
                  gpl_ok_ ? "OK" : "FAIL", gpl_scratch_);
@@ -2867,9 +3086,10 @@ class EcowittRFSensor : public PollingComponent {
         }
     }
 
-    void on_shutdown() override { save_rain(); save_display_history(); }
+    void on_shutdown() override { save_rain(); save_display_history(); save_forecast(); }
 
     void loop() override {
+        panel_hotspot_.tick(millis());
         register_web();  // retry until the shared HTTP server (captive_portal) is up
         drain_status_request();
         drain_config_queue();  // apply /config POSTs here, never in the web-server task
@@ -2878,26 +3098,37 @@ class EcowittRFSensor : public PollingComponent {
         // are read from the LCD chip, not GPIOs — see gpl811x.h. Events: short on
         // release, long at 2 s, extra-long at 5 s, 8.3 Hz +/- repeat (panel.h).
         if (gpl_ok_) {
+            power_tick(); alarm_tick(); buzzer_tick();
             if (walk_active_) {
                 // Segment-walk diagnostic owns the panel: fixed cadence, no keys/render.
                 walk_tick();
             } else {
                 panel_.clear_fx();
+                refresh_aq_rows();
+                const uint8_t previous_raw = panel_.raw;
                 PanelEvent ev;
-                while (panel_.event(ev))
-                    handle_panel_event(ev);
+                while (panel_.event(ev)) handle_panel_event(ev);
+                if (!panel_.raw) snooze_hold_consumed_ = false;
+                if (alarm_.snoozing && panel_.held != Btn::NONE && millis() - panel_.press_ms >= 2000UL) {
+                    alarm_.cancel_snooze(); snooze_hold_consumed_ = true;
+                    panel_.long_fired = panel_.xlong_fired = true;
+                    panel_.fx_redraw = true;
+                }
+                if (panel_.raw && panel_.raw != previous_raw) {
+                    press_started_dark_ = backlight_policy_.effective_level == 0;
+                    backlight_policy_.activity(millis()); power_tick(true);
+                }
                 // One HA-injected key per pass, through the identical handler, so a burst
                 // walks the state machine step by step instead of collapsing into one.
                 if (key_q_len_ > 0) {
                     PanelEvent iev = key_q_[key_q_head_];
                     key_q_head_ = (uint8_t)((key_q_head_ + 1) % KEY_Q_MAX);
                     key_q_len_--;
+                    press_started_dark_ = backlight_policy_.effective_level == 0;
                     handle_panel_event(iev);
                 }
                 panel_.tick();
                 apply_panel_fx();
-                buzzer_tick();
-                alarm_tick();
                 // Immediate refresh on any panel activity; otherwise repaint on every 0.5 s
                 // blink-phase change (colon, alarm bell, storm icon, setting fields).
                 if (panel_.fx_redraw || render_due())
@@ -2966,10 +3197,14 @@ class EcowittRFSensor : public PollingComponent {
         // Accepted = enabled (family + sensor) and a repeat sighting. Only accepted readings
         // may claim/drive the primary array and rain state below.
         const bool accepted = family_enabled(r.family) && sen_enabled && was_seen;
-        const bool array_primary = accepted && is_primary_array(r.family) &&
-                                   claim_primary(primary_array_key_, primary_array_ms_, key, now_ms);
-        const bool rain_primary = accepted && is_rain_family(r.family) &&
-                                  claim_primary(primary_rain_key_, primary_rain_ms_, key, now_ms);
+        if (ridx >= 0) {
+            roster_[ridx].model = r.model; roster_[ridx].fields = r.present;
+            roster_[ridx].accepted = accepted;
+        }
+        select_display_sources();
+        const bool array_primary = accepted && key == primary_array_key_;
+        const bool th_primary = accepted && key == primary_th_key_;
+        const bool rain_primary = accepted && key == primary_rain_key_;
 
         // Fold rain-capable counters into the running aggregate (sampled for every heard
         // sensor so the delta baseline is always current, even for a disabled one). Only the
@@ -2980,7 +3215,7 @@ class EcowittRFSensor : public PollingComponent {
             uint32_t now_unix = 0;
             if (time_clock) {
                 ESPTime t = time_clock->now();
-                if (t.is_valid()) {
+                if (panel_clock_valid(t)) {
                     doy = t.day_of_year; hour = t.hour; month = t.month; year = t.year;
                     week = ecowitt_rf::rain_week_key(year, doy);
                     now_unix = (uint32_t)t.timestamp;
@@ -3009,7 +3244,12 @@ class EcowittRFSensor : public PollingComponent {
             r.rain_rate_mmh = agg.rate_mmh;
             r.last24h_rain_mm = agg.last24h_mm;
             r.last1h_rain_mm = agg.last1h_mm;
-            bool dirty = rain_.take_dirty();
+            bool total_changed = false;
+            if (rain_primary && !waiting) {
+                const auto *bucket = rain_.find(key);
+                if (bucket) total_changed = rain_console_total_.observe(*bucket);
+            }
+            bool dirty = rain_.take_dirty() || total_changed;
             bool rolled = rain_.take_rolled();
             if (rain_primary) {
                 bool promoted = rain_.promote(key);
@@ -3021,9 +3261,15 @@ class EcowittRFSensor : public PollingComponent {
         }
 
         apply_windows(r, array_primary);
-        track_maxmin(r, array_primary, rain_primary);   // all-time MAX/MIN (panel modes 2/3)
-        if (ridx >= 0)
-            map_reading(r, roster_[ridx].v);   // after windows so the card carries max_gust/wind_avg
+        track_maxmin(r, th_primary, rain_primary);   // all-time MAX/MIN (panel modes 2/3)
+        if (ridx >= 0) {
+            map_reading(r, roster_[ridx].v);
+            if (aq_supports_lcd(r.family) && roster_[ridx].v.has(UiState::PM25)) {
+                const float concentration = roster_[ridx].v.v[UiState::PM25];
+                const int16_t aqi = stock_us_epa_2012_pm25_aqi((uint16_t)std::min(65534L, lroundf(concentration * 10)));
+                if (aqi >= 0) roster_[ridx].v.set(UiState::AQI, aqi);
+            }
+        }   // after windows so the card carries max_gust/wind_avg
 
         if (!family_enabled(r.family) || !sen_enabled)
             return;  // discovered but disabled — still shown in the roster
@@ -3031,30 +3277,42 @@ class EcowittRFSensor : public PollingComponent {
             return;  // first sighting — don't upload until it repeats (phantom-entity guard)
 
         update_ui_state(r, rain_primary, array_primary);
-        track_display_history(r, array_primary, rain_primary);
+        refresh_selected_values();
+        if (r.family == Family::WH31 && channel_history_.sample(r.channel, key,
+            r.has(F_TEMP) ? r.temp_c : NAN, r.has(F_HUM) ? r.humidity : NAN)) history_dirty_ = true;
+        track_display_history(r, th_primary, rain_primary);
+        track_selected_extra_history(r, key);
+        if (key == primary_indoor_key_ && r.has(F_PRESS)) pressure_observed(r.pressure_hpa);
         publish(r, rain_primary);   // native API + MQTT: cheap and non-blocking, so every packet goes out
 
         // Upload sockets stay on the worker task. Honour "Upload Interval" per sensor
         // to bound queue pressure without starving the fast RF poll.
         // The limit is PER SENSOR (roster slot): one global timestamp let whichever family
         // happened to transmit first after each interval win, starving the others.
-        // Remote WH25 is NOT uploaded via the RF loop — the built-in sensor owns the indoor
-        // slot in update() (GW1100 rule).
-        if (r.family != Family::WH25 && ridx >= 0) {
+        // The same independent owners drive the LCD, native values and station upload keys.
+        // Channel sensors keep their own protocol fields.
+        Reading upload_value;
+        const int16_t aq_upload_slot = aq_source_slot();
+        const uint32_t aq_key = aq_upload_slot < 0 ? 0 :
+            (((uint32_t)roster_[aq_upload_slot].family << 24) | (roster_[aq_upload_slot].id & 0xffffff));
+        const UploadSources sources{primary_th_key_, primary_array_key_, primary_uv_key_,
+            primary_solar_key_, primary_indoor_key_, primary_rain_key_, aq_key};
+        if (ridx >= 0 && select_upload_reading(r, key, sources, upload_value)) {
             uint32_t &last_up = roster_[ridx].last_up_ms;
             if (last_up == 0 || (now_ms - last_up) >= (uint32_t)cfg_.interval_s * 1000UL) {
                 last_up = now_ms ? now_ms : 1;
-                upload_reading(r);
+                upload_reading(upload_value);
             }
         }
     }
 
     void update() override {
         // Periodic (16 s): device info + register diagnostics + roster text.
-        ptrend_tick();          // hourly pressure sample for the trend pointer
+        select_display_sources();
+        daily_history_tick();
         if (rain_save_pending_ && millis() - rain_save_ms_ >= RAIN_SAVE_MS)
             save_rain();        // throttled rain increments (see RAIN_SAVE_MS)
-        forecast_tick();        // 10 min + hourly samples for the forecast icons
+        forecast_tick();        // persist timestamped observations; never resample cached pressure
         publish_panel_mode();   // push the panel mode/page text sensor on change
         float it = 0, ih = 0, ip = 0;
         bool th_ok = indoor_.read_th(it, ih);
@@ -3069,6 +3327,11 @@ class EcowittRFSensor : public PollingComponent {
         // humidityin / baromrelhpa+baromabshpa); it is not an RF packet.
         Reading r;
         r.family = Family::WH25;
+        r.allow_battery_upload = console_power_.known();
+        if (console_power_.known()) {
+            r.battery_low = console_power_.low();
+            r.battery_v = console_power_.millivolts() / 1000.0f;
+        }
         if (th_ok) {
             r.temp_c = it; r.mark(F_TEMP);
             r.humidity = (int)(ih + 0.5f); r.mark(F_HUM);
@@ -3076,17 +3339,19 @@ class EcowittRFSensor : public PollingComponent {
         if (p_ok) { r.pressure_hpa = ip; r.mark(F_PRESS); }
         apply_calibration(r);
 
-        if (th_ok) {
+        if (th_ok && primary_indoor_key_ == 0) {
             if (temp) temp->publish_state(r.temp_c);
             if (humidity) humidity->publish_state(r.humidity);
             ui_.set(UiState::T_IN, r.temp_c);   // built-in indoor sensor -> dashboard
             ui_.set(UiState::H_IN, r.humidity);
         }
-        if (p_ok) {
+        if (p_ok && primary_indoor_key_ == 0) {
             if (pressure) pressure->publish_state(r.pressure_hpa);
             ui_.set(UiState::P, r.pressure_hpa);
-        }
-        track_display_history(r, false, false, true);
+            pressure_observed(r.pressure_hpa);
+        } else if (!p_ok && primary_indoor_key_ == 0) ui_.clear(UiState::P);
+        if (primary_indoor_key_ == 0) track_display_history(r, false, false, true);
+        refresh_selected_values();
         // GPL811x display: store the indoor temperature and refresh the panel.
         if (th_ok) {
             indoor_temp_ = r.temp_c;
@@ -3094,8 +3359,8 @@ class EcowittRFSensor : public PollingComponent {
                 render_panel();
         }
         if (th_ok || p_ok) {
-            record_builtin(r.temp_c, r.humidity, r.pressure_hpa);  // built-in roster card
-            upload_reading(r);
+            record_builtin(r);  // presence flags retain valid zeroes
+            if (primary_indoor_key_ == 0) upload_reading(r);
         }
         publish_device_info();
         rssi_dbm_ = (int8_t)((int)read_reg(0x70) - 128);
@@ -3146,6 +3411,10 @@ class EcowittRFSensor : public PollingComponent {
     ESPPreferenceObject panel_pref_;
     ESPPreferenceObject maxmin_pref_;
     ESPPreferenceObject history_pref_;
+    ESPPreferenceObject forecast_pref_;
+    ESPPreferenceObject panel_options_pref_;
+    ESPPreferenceObject channel_history_pref_;
+    ESPPreferenceObject rain_total_pref_;
     ESPPreferenceObject srv_keys_pref_;
     ESPPreferenceObject rel_pref_;
 
@@ -3198,7 +3467,7 @@ class EcowittRFSensor : public PollingComponent {
         uint16_t doy = 1;
         if (time_clock) {
             ESPTime t = time_clock->now();
-            if (t.is_valid()) doy = t.day_of_year;
+            if (panel_clock_valid(t)) doy = t.day_of_year;
         }
         uint32_t now = millis();
 
@@ -3253,26 +3522,37 @@ class EcowittRFSensor : public PollingComponent {
         // "Indoor Humidity" entity was a 50/50 interleave of the console and the outdoor
         // array. Outdoor T/H now has its own pair of sensors, driven only by the primary
         // array.
-        if (is_primary_array(r.family)) {
-            if (outdoor_temp && r.has(F_TEMP))        outdoor_temp->publish_state(r.temp_c);
-            if (outdoor_humidity && r.has(F_HUM))     outdoor_humidity->publish_state(r.humidity);
+        const uint32_t key = ((uint32_t)r.family << 24) | (r.id & 0xffffff);
+        if (key == primary_th_key_) {
+            if (outdoor_temp && r.has(F_TEMP)) outdoor_temp->publish_state(r.temp_c);
+            if (outdoor_humidity && r.has(F_HUM)) outdoor_humidity->publish_state(r.humidity);
         }
-        // Publish only the fields this family actually carried (see Reading::has()).
-        if (wind_speed && r.has(F_WIND))              wind_speed->publish_state(r.wind_mps);
-        if (wind_dir && r.has(F_WDIR))                wind_dir->publish_state(r.wind_dir_deg);
-        if (gust && r.has(F_GUST))                    gust->publish_state(r.gust_mps);
+        if (key == primary_array_key_) {
+            if (wind_speed && r.has(F_WIND)) wind_speed->publish_state(r.wind_mps);
+            if (wind_dir && r.has(F_WDIR)) wind_dir->publish_state(r.wind_dir_deg);
+            if (gust && r.has(F_GUST)) gust->publish_state(r.gust_mps);
+        }
+        if (key == primary_indoor_key_) {
+            if (temp && r.has(F_TEMP)) temp->publish_state(r.temp_c);
+            if (humidity && r.has(F_HUM)) humidity->publish_state(r.humidity);
+            if (pressure && r.has(F_PRESS)) pressure->publish_state(r.pressure_hpa);
+        }
         if (rain_primary) {   // one rain sensor drives the HA rain entities
             if (rain) rain->publish_state(r.rain_mm);
             if (rain_rate) rain_rate->publish_state(r.rain_rate_mmh);
         }
-        if (uv && r.has(F_UV))                        uv->publish_state(r.uv);
-        if (light && r.has(F_LIGHT))                  light->publish_state(r.light_wm2);
+        if (uv && key == primary_uv_key_ && r.has(F_UV))                        uv->publish_state(r.uv);
+        if (light && key == primary_solar_key_ && r.has(F_LIGHT))                  light->publish_state(r.light_wm2);
         if (soil_moisture && r.moisture_pct)          soil_moisture->publish_state(r.moisture_pct);
         if (soil_temp && r.soil_temp_c != 0)          soil_temp->publish_state(r.soil_temp_c);
         if (soil_ec && r.soil_ec_uscm > 0)            soil_ec->publish_state(r.soil_ec_uscm);
-        if (pm25 && r.pm25_ugm3)                      pm25->publish_state(r.pm25_ugm3);
-        if (pm10 && r.pm10_ugm3)                      pm10->publish_state(r.pm10_ugm3);
-        if (co2 && r.co2_ppm)                         co2->publish_state(r.co2_ppm);
+        const int16_t aq_slot = native_aq_source_slot();
+        const bool aq_owner = aq_slot >= 0 && key == (((uint32_t)roster_[aq_slot].family << 24) | (roster_[aq_slot].id & 0xffffff));
+        if (aq_owner) {
+            if (pm25 && r.has(F_PM25)) pm25->publish_state(std::isfinite(r.pm25_exact_ugm3) ? r.pm25_exact_ugm3 : r.pm25_ugm3);
+            if (pm10 && r.has(F_PM10)) pm10->publish_state(r.pm10_ugm3);
+            if (co2 && r.has(F_CO2)) co2->publish_state(r.co2_ppm);
+        }
         if (leaf_wetness && r.leaf_wetness)           leaf_wetness->publish_state(r.leaf_wetness);
         if (lightning_strikes && r.strikes)           lightning_strikes->publish_state(r.strikes);
         if (lightning_distance && r.lightning_dist_km > 0) lightning_distance->publish_state(r.lightning_dist_km);
@@ -3362,7 +3642,7 @@ class EcowittRFSensor : public PollingComponent {
             o["id"] = id;
             o["ch"] = r.channel;
             o["rssi"] = r.rssi_dbm;
-            o["batt"] = r.battery_low ? 0 : 1;
+            if (r.allow_battery_upload) o["batt"] = r.battery_low ? 0 : 1;
             o["ts"] = (uint32_t)::time(nullptr);
             if (r.has(F_TEMP)) o["temp_c"] = r.temp_c;
             if (r.has(F_HUM)) o["humidity"] = r.humidity;
@@ -3370,7 +3650,7 @@ class EcowittRFSensor : public PollingComponent {
             if (r.has(F_WIND)) o["wind_mps"] = r.wind_mps;
             if (r.has(F_GUST)) o["gust_mps"] = r.gust_mps;
             if (r.has(F_WDIR)) o["wind_dir_deg"] = r.wind_dir_deg;
-            if (is_rain_family(r.family)) {
+            if (r.allow_rain_upload && is_rain_family(r.family)) {
                 o["rain_mm"] = r.rain_mm;
                 o["rain_rate_mmh"] = r.rain_rate_mmh;
                 o["rain_event_mm"] = r.rain_event_mm;
@@ -3386,9 +3666,10 @@ class EcowittRFSensor : public PollingComponent {
             if (r.moisture_pct) o["soil_moist_pct"] = r.moisture_pct;
             if (r.soil_temp_c != 0) o["soil_temp_c"] = r.soil_temp_c;
             if (r.soil_ec_uscm > 0) o["soil_ec_uscm"] = r.soil_ec_uscm;
-            if (r.pm25_ugm3) o["pm25_ugm3"] = r.pm25_ugm3;
-            if (r.pm10_ugm3) o["pm10_ugm3"] = r.pm10_ugm3;
-            if (r.co2_ppm) o["co2_ppm"] = r.co2_ppm;
+            if (r.has(F_PM1)) o["pm1_ugm3"] = r.pm1_ugm3;
+            if (r.has(F_PM25)) o["pm25_ugm3"] = std::isfinite(r.pm25_exact_ugm3) ? r.pm25_exact_ugm3 : r.pm25_ugm3;
+            if (r.has(F_PM10)) o["pm10_ugm3"] = r.pm10_ugm3;
+            if (r.has(F_CO2)) o["co2_ppm"] = r.co2_ppm;
             if (r.leaf_wetness) o["leaf_wetness"] = r.leaf_wetness;
             if (r.strikes) o["strikes"] = r.strikes;
             if (r.lightning_dist_km > 0) o["lightning_dist_km"] = r.lightning_dist_km;
@@ -3419,6 +3700,10 @@ class EcowittRFSensor : public PollingComponent {
         panel_pref_ = global_preferences->make_preference<uint8_t[sizeof(PanelSettings)]>(PREF_PANEL, true);
         maxmin_pref_ = global_preferences->make_preference<uint8_t[sizeof(MaxMin)]>(PREF_MAXMIN, true);
         history_pref_ = global_preferences->make_preference<DisplayHistory>(PREF_DISPLAY_HISTORY, true);
+        forecast_pref_ = global_preferences->make_preference<ForecastHistory>(PREF_FORECAST, true);
+        panel_options_pref_ = global_preferences->make_preference<PanelOptions>(PREF_PANEL_OPTIONS, true);
+        channel_history_pref_ = global_preferences->make_preference<ChannelHistory>(PREF_CHANNEL_HISTORY, true);
+        rain_total_pref_ = global_preferences->make_preference<RainTotalCheckpoint>(PREF_RAIN_TOTAL, true);
         srv_keys_pref_ = global_preferences->make_preference<ServerKeys>(PREF_SRV_KEYS, true);
         rel_pref_ = global_preferences->make_preference<float>(PREF_PANEL_REL, true);
     }
@@ -3539,9 +3824,11 @@ class EcowittRFSensor : public PollingComponent {
         rp.month_mm = b.month_mm; rp.year_mm = b.year_mm;
         rp.mark_doy = b.mark_doy; rp.mark_month = b.mark_month; rp.mark_year = b.mark_year;
         rain_pref_.save(&rp);
+        const auto total_checkpoint = rain_console_total_.checkpoint(b, rain_.calendar_policy());
+        if (total_checkpoint.valid()) rain_total_pref_.save(&total_checkpoint);
         uint32_t last_rain_unix = b.last_rain_unix;
         rain_evt_pref_.save(&last_rain_unix);
-        if (time_clock && time_clock->now().is_valid()) {
+        if (time_clock && panel_clock_valid(time_clock->now())) {
             auto snapshot = RainCheckpoint::capture(b, (uint32_t)time_clock->now().timestamp, millis());
             if (snapshot.valid()) rain_checkpoint_saved_ = rain_windows_pref_.save(&snapshot);
         }
@@ -3677,6 +3964,9 @@ class EcowittRFSensor : public PollingComponent {
         uint32_t last_ms = 0;
         bool battery_low = false;
         uint32_t last_up_ms = 0;  // last HTTP upload of this sensor (per-sensor rate limit)
+        uint8_t model = 0;
+        uint32_t fields = 0;
+        bool accepted = false;
         UiState v;             // this sensor's own latest readings (per-sensor, not shared)
     };
     RosterEntry roster_[32];
@@ -3744,24 +4034,21 @@ class EcowittRFSensor : public PollingComponent {
 
     // The gateway's own built-in indoor T/H/P (I2C, not RF) gets its own roster card so it
     // appears alongside the RF sensors. family=Builtin, id=0 (no RF id).
-    void record_builtin(float temp_c, float humidity, float pressure_hpa) {
-        for (size_t i = 0; i < roster_count_; i++) {
-            if (roster_[i].family == Family::Builtin) {
-                roster_[i].last_ms = millis();
-                if (temp_c != 0) roster_[i].v.set(UiState::T_IN, temp_c);
-                if (humidity) roster_[i].v.set(UiState::H_IN, humidity);
-                if (pressure_hpa > 0) roster_[i].v.set(UiState::P, pressure_hpa);
-                return;
-            }
+    void record_builtin(const Reading &r) {
+        RosterEntry *entry = nullptr;
+        for (size_t i = 0; i < roster_count_; ++i)
+            if (roster_[i].family == Family::Builtin) { entry = &roster_[i]; break; }
+        if (!entry && roster_count_ < sizeof(roster_) / sizeof(roster_[0])) {
+            entry = &roster_[roster_count_++];
+            *entry = RosterEntry{};
+            entry->family = Family::Builtin;
         }
-        if (roster_count_ < sizeof(roster_) / sizeof(roster_[0])) {
-            RosterEntry &e = roster_[roster_count_++];
-            e.family = Family::Builtin; e.id = 0; e.channel = 0;
-            e.last_ms = millis();
-            if (temp_c != 0) e.v.set(UiState::T_IN, temp_c);
-            if (humidity) e.v.set(UiState::H_IN, humidity);
-            if (pressure_hpa > 0) e.v.set(UiState::P, pressure_hpa);
-        }
+        if (!entry) return;
+        entry->last_ms = millis();
+        entry->v = UiState{};
+        if (r.has(F_TEMP)) entry->v.set(UiState::T_IN, r.temp_c);
+        if (r.has(F_HUM)) entry->v.set(UiState::H_IN, r.humidity);
+        if (r.has(F_PRESS)) entry->v.set(UiState::P, r.pressure_hpa);
     }
 
     void publish_roster() {

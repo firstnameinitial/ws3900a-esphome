@@ -140,9 +140,17 @@ int main() {
     // Dated event: rain at T, reboot (millis small), still cleared at T + 24 h.
     evt.sample((uint8_t)Family::WS90, 9, 50.4f, 270, 18, rain_week_key(2026, 270), 9, 2026, 1000, a, 1790530000);
     eq(a.event_mm, 0.4f);
-    evt.sample((uint8_t)Family::WS90, 9, 50.4f, 271, 17, rain_week_key(2026, 271), 9, 2026, 50, a, 1790530000 + 80000);
+    // Simulate an actual legacy restart: runtime windows and observation coverage
+    // are absent, rather than turning millis backwards in a still-running object.
+    RainAggregator rebooted;
+    rebooted.set_count(1);
+    auto &reboot_bucket = rebooted.buckets()[0];
+    reboot_bucket.key = eb.key; reboot_bucket.last_counter = eb.last_counter;
+    reboot_bucket.event_mm = eb.event_mm; reboot_bucket.last_rain_unix = eb.last_rain_unix;
+    reboot_bucket.restore_calendar(270,9,2026);
+    rebooted.sample((uint8_t)Family::WS90, 9, 50.4f, 271, 17, rain_week_key(2026, 271), 9, 2026, 50, a, 1790530000 + 80000);
     eq(a.event_mm, 0.4f);
-    evt.sample((uint8_t)Family::WS90, 9, 50.4f, 271, 19, rain_week_key(2026, 271), 9, 2026, 60, a, 1790530000 + 86400);
+    rebooted.sample((uint8_t)Family::WS90, 9, 50.4f, 271, 19, rain_week_key(2026, 271), 9, 2026, 60, a, 1790530000 + 86400);
     eq(a.event_mm, 0);
 
     // cal_rain regression: a gain change must never create rain. The gain used to multiply

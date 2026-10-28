@@ -66,6 +66,7 @@ main{padding:16px;max-width:1280px;margin:0 auto}
 .f input.in,.f select.in{text-transform:none}
 .in{background:var(--panel2);border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:8px 10px;font:inherit;font-size:14px;width:100%}
 .in:focus{outline:1px solid var(--acc);border-color:var(--acc)}
+.in:disabled,.tgl:disabled,.btn:disabled{opacity:.45;cursor:not-allowed}
 input.mono,select.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .kwrap{display:flex;gap:6px}
 .kwrap .in{flex:1}
@@ -195,6 +196,20 @@ input.tgl:checked::after{left:20px;background:#fff}
           <label class="f">UV gain<input id="cal_uv_g" class="in mono" type="number" step="0.01"></label>
         </div>
       </div>
+      <div class="panel" id="panelOptions">
+        <div class="sub">Console</div>
+        <div class="frm">
+          <label class="f">Backlight schedule<input id="pn_schedule" class="tgl" type="checkbox"></label>
+          <label class="f">Light on<input id="pn_on" class="in mono" type="time" step="60" required></label>
+          <label class="f">Light off<input id="pn_off" class="in mono" type="time" step="60" required></label>
+          <label class="f">Daily high/low reset<input id="pn_hilo" class="tgl" type="checkbox"></label>
+          <label class="f">Rain day reset<select id="pn_day" class="in mono"><option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option><option value="3">03:00</option><option value="4">04:00</option><option value="5">05:00</option><option value="6">06:00</option><option value="7">07:00</option><option value="8">08:00</option><option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option><option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option><option value="15">15:00</option><option value="16">16:00</option><option value="17">17:00</option><option value="18">18:00</option><option value="19">19:00</option><option value="20">20:00</option><option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option></select></label>
+          <label class="f">Week starts<select id="pn_week" class="in"><option value="0">Sunday</option><option value="1">Monday</option></select></label>
+          <label class="f">Rain season starts<select id="pn_season" class="in"><option value="1">January</option><option value="2">February</option><option value="3">March</option><option value="4">April</option><option value="5">May</option><option value="6">June</option><option value="7">July</option><option value="8">August</option><option value="9">September</option><option value="10">October</option><option value="11">November</option><option value="12">December</option></select></label>
+          <label class="f">Rain priority<select id="pn_piezo" class="in"><option value="1">Piezo</option><option value="0">Tipping bucket</option></select></label>
+        </div>
+        <div class="row"><button id="panelSave" class="btn primary" type="button">Save console</button><span id="panelSaveStat" class="sstat"></span></div>
+      </div>
       <div class="panel">
         <div class="sub">Sensor families</div>
         <div id="famTog" class="togs"></div>
@@ -211,6 +226,8 @@ input.tgl:checked::after{left:20px;background:#fff}
 const STATE_URL='/state', CONFIG_URL='/config', POLL=15000;
 let S=null, online=false, demoMode=false, lastFetchAt=null, formsBuilt=false, curTab='live';
 let sortKey='last', sortDir=-1;
+let panelSupported=false, panelFormsBuilt=false, panelDirty=false, panelSaving=false;
+const PANEL_IDS=['pn_schedule','pn_on','pn_off','pn_hilo','pn_day','pn_week','pn_season','pn_piezo'];
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function fmt(v,d){if(v==null||v==='')return '';const n=Number(v);return isFinite(n)?(d!=null?n.toFixed(d):String(Math.round(n))):'';}
@@ -402,6 +419,68 @@ function renderSystem(){
   $('cal_uv_g').value=cal.uv_g!=null?cal.uv_g:1;
   buildFam(c.fam_en||{});
 }
+function panelAvailable(){return !!(S&&S.cfg&&S.cfg.panel&&typeof S.cfg.panel==='object'&&!Array.isArray(S.cfg.panel));}
+function panelTime(value,fallback){
+  const n=Number.isInteger(value)&&value>=0&&value<1440?value:fallback;
+  return String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+}
+function panelMinute(id){
+  const m=/^([01]\d|2[0-3]):([0-5]\d)$/.exec($(id).value);
+  if(!m)throw new Error('Invalid light time');
+  return Number(m[1])*60+Number(m[2]);
+}
+function panelInteger(id,lo,hi){
+  const value=$(id).value,n=Number(value);
+  if(value===''||!Number.isInteger(n)||n<lo||n>hi)throw new Error('Invalid rain setting');
+  return n;
+}
+function panelBoolean(id){
+  const v=$(id).value;
+  if(v!=='0'&&v!=='1')throw new Error('Invalid rain setting');
+  return v==='1';
+}
+function renderPanelOptions(){
+  const available=panelAvailable(),changed=available!==panelSupported;
+  panelSupported=available;
+  PANEL_IDS.forEach(id=>$(id).disabled=!available);
+  $('panelSave').disabled=!available||panelSaving;
+  const status=$('panelSaveStat');
+  if(!available){panelDirty=false;status.textContent='Unavailable';status.className='sstat';}
+  else if(changed&&status.textContent==='Unavailable'){status.textContent='';status.className='sstat';}
+  const active=document.activeElement;
+  if(!panelFormsBuilt||changed||(!panelDirty&&!(active&&PANEL_IDS.includes(active.id)))){
+    const p=available?S.cfg.panel:{},b=p.schedule||{},r=p.rain||{};
+    $('pn_schedule').checked=b.enabled===true;
+    $('pn_on').value=panelTime(b.on_minute,420);
+    $('pn_off').value=panelTime(b.off_minute,1320);
+    $('pn_hilo').checked=p.daily_hilo===true;
+    $('pn_day').value=String(Number.isInteger(r.day_hour)&&r.day_hour>=0&&r.day_hour<=23?r.day_hour:0);
+    $('pn_week').value=r.week_monday===true?'1':'0';
+    $('pn_season').value=String(Number.isInteger(r.season_month)&&r.season_month>=1&&r.season_month<=12?r.season_month:1);
+    $('pn_piezo').value=r.prefer_piezo===false?'0':'1';
+    panelFormsBuilt=true;
+  }
+}
+function collectPanel(){
+  return {schedule:{enabled:$('pn_schedule').checked,on_minute:panelMinute('pn_on'),off_minute:panelMinute('pn_off')},
+    rain:{day_hour:panelInteger('pn_day',0,23),week_monday:panelBoolean('pn_week'),season_month:panelInteger('pn_season',1,12),prefer_piezo:panelBoolean('pn_piezo')},
+    daily_hilo:$('pn_hilo').checked};
+}
+async function savePanel(){
+  if(panelSaving)return;
+  const status=$('panelSaveStat');
+  try{
+    if(!panelAvailable())throw new Error('Unavailable');
+    const panel=collectPanel();
+    panelSaving=true;$('panelSave').disabled=true;status.textContent='saving';status.className='sstat';
+    const r=await fetch(CONFIG_URL,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'j='+encodeURIComponent(JSON.stringify({panel:panel}))});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false)throw new Error(j.err||('HTTP '+r.status));
+    S.cfg=j.cfg||{...S.cfg,panel:panel};panelDirty=false;
+    status.textContent='saved';status.className='sstat good';renderPanelOptions();
+  }catch(e){panelDirty=true;status.textContent=e.message||'failed';status.className='sstat crit';}
+  finally{panelSaving=false;$('panelSave').disabled=!panelAvailable();}
+}
 function renderDevInfo(){
   const d=S.dev||{};
   const it=[['MAC',d.mac],['IP',d.ip],['SSID',d.ssid],['WiFi RSSI',d.wifi_rssi!=null?d.wifi_rssi+' dBm':null],['Free heap',fmtKB(d.heap)],['Uptime',fmtUpt(d.uptime)],['Firmware',d.fw]];
@@ -427,7 +506,7 @@ function collectCfg(){
   return {up:up,tz:$('tz').value,rf:parseInt($('rf').value,10)||868,cal:cal,fam_en:fam_en,servers:collectServers()};
 }
 async function save(target){
-  const cfg=collectCfg(), old=S.cfg; S.cfg=cfg;
+  const cfg=collectCfg(), old=S.cfg; S.cfg={...(old||{}),...cfg};
   const st=$(target==='sys'?'sysSaveStat':'upSaveStat');
   st.textContent='saving???';st.className='sstat';
   try{
@@ -453,6 +532,7 @@ async function load(){
   renderUpStat();renderDevInfo();
   if(!formsBuilt){renderUpload();renderSystem();formsBuilt=true;}
   else buildFam((S.cfg&&S.cfg.fam_en)||{});
+  renderPanelOptions();
 }
 function tick(){
   $('clock').textContent=new Date().toTimeString().slice(0,8);
@@ -484,6 +564,9 @@ function init(){
   document.querySelectorAll('.rost th[data-k]').forEach(th=>th.addEventListener('click',()=>setSort(th.dataset.k)));
   $('upSave').addEventListener('click',()=>save('up'));
   $('sysSave').addEventListener('click',()=>save('sys'));
+  $('panelSave').addEventListener('click',savePanel);
+  PANEL_IDS.forEach(id=>$(id).addEventListener('input',()=>{panelDirty=true;}));
+  PANEL_IDS.forEach(id=>$(id).addEventListener('change',()=>{panelDirty=true;}));
   $('upReveal').addEventListener('click',e=>{e.preventDefault();const i=$('up_key'),s=i.type==='password';i.type=s?'text':'password';$('upReveal').textContent=s?'hide':'show';});
   $('srvAdd').addEventListener('click',()=>{const d=document.createElement('div');d.innerHTML=srvRow({proto:'wunderground',host:'',port:80,path:'',key:'',en:false});$('srvList').appendChild(d.firstChild);});
   $('srvList').addEventListener('click',e=>{if(e.target.classList.contains('sd'))e.target.closest('.srv').remove();});
