@@ -135,3 +135,21 @@ in b1f95b5, with a separate validated preference and automatic-channel reset.
 [Sensor settings and device qualification](sensor-settings.md).
 Thirty host programs and both dashboard suites pass; Mac/Linux builds and actual
 restart/rollback/reinstall retention pass. Physical acceptance limits above remain.
+
+## Version 1.0 acceptance —29 October2026
+
+An actual DC unplug/replug produced reset reason POWERON, with restored sensor
+preferences, rain TOTAL and24hourly/1daily pressure observations by the first read
+at9s uptime. The clock was already valid; this does not test deliberately delayed NTP.
+
+The cold-start path originally forced Medium brightness. Version 1.0 removes that
+stock-behaviour override and restores the saved DC brightness, including Off, on
+cold and warm starts. All five saved levels are regression-tested; live supply
+transitions retain their existing Medium/battery-wake policy. See the final release
+notes for the installed brightness-retest result.
+
+The remaining physical button/alarm, fresh-rain and optional-hardware checks are
+explicitly deferred. Automated coverage and the earlier observations remain as
+listed; version 1.0 does not certify those deferred physical outcomes. Startup
+brightness restoration intentionally follows the retained user preference rather
+than the stock default-Medium rule.

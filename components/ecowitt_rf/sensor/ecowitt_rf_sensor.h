@@ -1002,7 +1002,7 @@ class EcowittRFSensor : public PollingComponent {
         j.field("heap", (uint32_t)ESP.getFreeHeap());
         j.field("uptime", (uint32_t)(millis() / 1000));
         j.field("fw", ESPHOME_VERSION);
-        j.field("build", "sensor-overrides-20261029b");
+        j.field("build", "ws3900a-1.0.0-20261029");
         j.field("ts", (uint32_t)::time(nullptr));
 
         j.field("reset_reason", (int)esp_reset_reason());
@@ -3108,7 +3108,8 @@ class EcowittRFSensor : public PollingComponent {
         // with the RF chip, so both CS lines stay high when idle and never overlap here).
         gpl_ok_ = ecowitt_rf::gpl_init();
         console_power_.begin();
-        if (esp_reset_reason() == ESP_RST_POWERON) pset_.backlight = 2;
+        // load_panel() restores the chosen brightness on cold and warm starts.
+        // Live supply transitions retain the separate medium/battery-wake policy.
         gpl_scratch_ = ecowitt_rf::gpl_dbg_scratch();
         ESP_LOGW(TAG, "GPL811x ready-check: %s (scratch readback 0x%02x, want 0x5a)",
                  gpl_ok_ ? "OK" : "FAIL", gpl_scratch_);

@@ -1,6 +1,6 @@
 # WS3900A ESPHome firmware
 
-**Beta. Initial installation requires opening the case and serial flashing;
+**Version 1.0.0. Initial installation requires opening the case and serial flashing;
 this can damage or brick your device. No warranty.**
 Independent project, not affiliated with or endorsed by Ecowitt or Fine Offset.
 
@@ -86,3 +86,13 @@ Dashboard checks also include `node tests/dashboard_panel_test.js`.
 
 Per-sensor API name/channel settings now survive restarts; see
 [Sensor settings](docs/sensor-settings.md) for partial updates and automatic-channel reset.
+
+## Qualification
+
+Version 1.0 covers the WS3900A console with the documented supported sensor paths.
+An installed 868 MHz console with WS90 and WH31 was checked through OTA rollback,
+restart and cold power loss. Optional transmitter families retain the hardware
+qualification limits in the [audit](docs/panel-capability-audit.md).
+Physical alarm/snooze and fresh-rain checks are deferred; their state and counter
+logic is covered by automated tests. RF decoder placeholders WH26/WH35/WH54 remain
+unsupported; the console's legacy WH26 battery field is a separate upload mapping.

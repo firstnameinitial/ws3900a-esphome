@@ -45,7 +45,8 @@ WiFi flashes fast while pairing/unjoined, slowly until a successful HTTP upload,
 then shows steady RSSI. RF bars indicate freshness, independently for each source.
 A separate icon shows calibrated console low/no-battery status, including on DC.
 
-On battery, any key wakes Medium for15s. DC transitions select Medium. Alarm runs
+Cold and warm DC starts restore the saved level, including Off. On battery, any
+key wakes Medium for15s. Live supply transitions select Medium. Alarm runs
 up to2min with accelerating cadence; LIGHT snoozes10min, another key stops it, and
 holding any key2s cancels snooze without invoking its normal hold action.
 

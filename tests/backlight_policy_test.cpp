@@ -4,6 +4,15 @@
 #include <cstdio>
 using namespace esphome::ecowitt_rf;
 int main() {
+    BacklightSchedule default_schedule;
+    for (uint8_t saved = 0; saved <= 4; ++saved) {
+        uint8_t restored = saved;
+        BacklightPolicy cold;
+        assert(cold.tick(0, true, restored, default_schedule) == saved && restored == saved);
+        assert(cold.tick(20000, true, restored, default_schedule) == saved);
+        BacklightPolicy warm;
+        assert(warm.tick(0, true, restored, default_schedule) == saved && restored == saved);
+    }
     BacklightPolicy p;BacklightSchedule s;uint8_t level=4;
     assert(p.tick(0,true,level,s)==4);
     assert(p.tick(100,false,level,s)==2 && level==2); // DC removal: medium then timeout

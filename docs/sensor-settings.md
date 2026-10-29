@@ -51,7 +51,9 @@ settings, uploads, rain/history and64 native entities were retained. All tempora
 records were removed. Host tests also cover full capacity, identity isolation,
 CRC/version rejection and failed-write/cache rollback.
 
-The earlier software persistence blocker is closed. A true cold power-loss/NTP
-check, owner-operated buttons/alarm-snooze and fresh-rain increments remain physical
-qualification. Recorded overnight daily-rain reset and dry-event expiry were also
-observed in HA history; they do not prove fresh-rain measurement or a cold power cut.
+The software persistence blocker is closed. A subsequent actual DC unplug/replug
+reported a power-on reset and restored sensor preferences, rain and pressure history.
+The clock had synchronised by the first available read; deliberately delayed NTP
+was not exercised physically. Owner-operated buttons/alarm-snooze and fresh-rain
+increments are deferred physical qualification. Recorded overnight daily-rain reset
+and dry-event expiry were observed separately; they do not prove fresh-rain measurement.
