@@ -127,3 +127,11 @@ battery/DC transitions, physical cold power loss/delayed NTP, live alarm/snooze
 cadence and optional AQ/WN32P hardware remain hardware qualification items. Calendar,
 AQ packets/sentinels/AQI, power transitions and alarm timing are covered by deterministic
 host fixtures. The source matrix distinguishes those tests from installed hardware.
+
+## Persistence follow-up —29 October2026
+
+The API name/channel override save path identified during1.0 review is corrected
+in b1f95b5, with a separate validated preference and automatic-channel reset.
+[Sensor settings and device qualification](sensor-settings.md).
+Thirty host programs and both dashboard suites pass; Mac/Linux builds and actual
+restart/rollback/reinstall retention pass. Physical acceptance limits above remain.
