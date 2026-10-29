@@ -83,3 +83,6 @@ The forecast starts partly cloudy and learns from real timestamped pressure read
 its trend baseline progressively fills over thirty observed days.
 
 Dashboard checks also include `node tests/dashboard_panel_test.js`.
+
+Per-sensor API name/channel settings now survive restarts; see
+[Sensor settings](docs/sensor-settings.md) for partial updates and automatic-channel reset.

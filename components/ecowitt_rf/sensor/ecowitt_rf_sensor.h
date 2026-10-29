@@ -70,6 +70,7 @@
 #include "wifi_indicator.h"
 #include "upload_selection.h"
 #include "startup_display.h"
+#include "sensor_overrides.h"
 #include "channel_history.h"
 #include "forecast_history.h"
 #include "segment_render.h"
@@ -98,6 +99,7 @@ enum : uint32_t {
     PREF_PANEL_OPTIONS = 0xE624,
     PREF_CHANNEL_HISTORY = 0xE626,
     PREF_RAIN_TOTAL = 0xE625,
+    PREF_SENSOR_OVERRIDES = 0xE627,
     PREF_CFG = 0xE601,       // consolidated DeviceConfig blob
     PREF_RAIN = 0xE612,      // compact rain-aggregate state (first bucket)
     PREF_DISABLED = 0xE614,  // per-sensor disable list
@@ -273,15 +275,16 @@ inline Family tag_to_family(const char *t) {
     return Family::Unknown;
 }
 
-// Persistent per-sensor config (flash): one slot per learned sensor, keyed by (family, id).
+// Runtime sensor slots; only explicit name/channel overrides are stored separately.
 struct SensorSlot {
-    uint8_t family;         // Family enum value
-    uint8_t id0, id1, id2;  // 24-bit sensor ID, big-endian
-    uint8_t channel;        // user-assigned channel (0-15)
-    uint8_t enabled;        // 1 = enabled
-    char name[16];          // user-assigned friendly name (empty = auto family name)
+    uint8_t family = 0;         // Family enum value
+    uint8_t id0 = 0, id1 = 0, id2 = 0;  // 24-bit sensor ID, big-endian
+    uint8_t channel = 0, physical_channel = 0; // effective and last reported channel
+    uint8_t enabled = 1;        // derived from legacy disabled list
+    char name[16]{};          // friendly name (empty = family name)
 };
 static constexpr uint8_t SENSOR_MAX = 24;
+static_assert(SENSOR_MAX == SensorOverrides::CAPACITY, "Sensor slot and override limits must match");
 
 // Fixed-size mirror of a Server — std::string can't be memcpy'd, so the upload-server list
 // is serialized to/from this POD. Sized so 3 servers + the config blob + the 13 template
@@ -999,7 +1002,7 @@ class EcowittRFSensor : public PollingComponent {
         j.field("heap", (uint32_t)ESP.getFreeHeap());
         j.field("uptime", (uint32_t)(millis() / 1000));
         j.field("fw", ESPHOME_VERSION);
-        j.field("build", "full-panel-20261028c");
+        j.field("build", "sensor-overrides-20261029a");
         j.field("ts", (uint32_t)::time(nullptr));
 
         j.field("reset_reason", (int)esp_reset_reason());
@@ -1086,6 +1089,9 @@ class EcowittRFSensor : public PollingComponent {
             j.field("source_indoor", primary_indoor_key_);
             j.field("backlight", backlight_policy_.effective_level);
             j.field("daily_hilo", pset_.rst_hilo != 0);
+            j.field("sensor_override_count", sensor_overrides_.count);
+            j.field("sensor_overrides_restored", sensor_overrides_restored_);
+            j.field("sensor_overrides_save_ok", sensor_overrides_save_ok_);
             j.field("hilo_date", panel_options_.hilo_date);
             j.field("aq_sel", panel_.aq_sel);          // date/AQ row selector
             j.field("moon", moon_phase());         // 0 new .. 4 full .. 7 waning crescent
@@ -1221,6 +1227,9 @@ class EcowittRFSensor : public PollingComponent {
             j.field("id", id);
             j.field("ch", sensor_slots_[i].channel);
             j.field("en", sensor_slots_[i].enabled != 0);
+            j.field("name", sensor_slots_[i].name);
+            const auto *override = sensor_overrides_.find(((uint32_t)sensor_slots_[i].family << 24) | sid);
+            j.field("channel_auto", !(override && (override->flags & SensorOverrides::CHANNEL)));
             j.end_object();
         }
         j.end_array();
@@ -1247,6 +1256,23 @@ class EcowittRFSensor : public PollingComponent {
             const auto integer = [](JsonVariant value, int lo, int hi) {
                 return value.isNull() || (value.is<int>() && value.as<int>() >= lo && value.as<int>() <= hi);
             };
+            if (!root["sensors"].isNull()) {
+                if (!root["sensors"].is<JsonArray>()) return false;
+                for (JsonVariant value : root["sensors"].as<JsonArray>()) {
+                    if (!value.is<JsonObject>()) return false;
+                    JsonObject row = value.as<JsonObject>();
+                    if (!row["fam"].is<const char *>() || !row["id"].is<const char *>()) return false;
+                    const Family family = tag_to_family(row["fam"].as<const char *>());
+                    uint32_t id = 0;
+                    if (family == Family::Unknown || !parse_sensor_override_id(row["id"].as<const char *>(), id)) return false;
+                    if (!row["ch"].isNull() && (!row["ch"].is<int>() ||
+                        !sensor_override_channel_valid((uint8_t)family, row["ch"].as<int>()))) return false;
+                    if (!row["name"].isNull() && (!row["name"].is<const char *>() ||
+                        strlen(row["name"].as<const char *>()) >= sizeof(SensorOverrides::Entry::name))) return false;
+                    if (!row["en"].isNull() && !row["en"].is<bool>()) return false;
+                    if (!row["channel_auto"].isNull() && !row["channel_auto"].is<bool>()) return false;
+                }
+            }
             JsonObject panel = root["panel"].as<JsonObject>();
             if (panel.isNull()) return true;
             JsonObject schedule = panel["schedule"].as<JsonObject>();
@@ -1331,18 +1357,16 @@ class EcowittRFSensor : public PollingComponent {
                     const char *idstr = s["id"].as<const char *>();
                     if (idstr == nullptr)
                         continue;
-                    uint32_t id = (uint32_t)strtoul(idstr, nullptr, 16);
-                    uint8_t ch = s["ch"].isNull() ? 0 : s["ch"].as<uint8_t>();
-                    bool en = s["en"].isNull() ? true : s["en"].as<bool>();
-                    // Enable-only toggle (no "ch" sent) must preserve the learned channel.
-                    if (s["ch"].isNull()) {
-                        int16_t ex = find_sensor((uint8_t)f, id);
-                        ch = (ex >= 0) ? sensor_slots_[ex].channel : 0;
-                    }
-                    set_sensor((uint8_t)f, id, ch, en);
-                    const char *nm = s["name"].as<const char *>();
-                    if (nm)
-                        set_sensor_name((uint8_t)f, id, nm);
+                    uint32_t id = 0;
+                    if (!parse_sensor_override_id(idstr, id)) continue;
+                    const SensorChannelMode mode = s["channel_auto"].as<bool>() ? SensorChannelMode::AUTO
+                        : !s["ch"].isNull() ? SensorChannelMode::SET : SensorChannelMode::KEEP;
+                    const uint8_t channel = s["ch"].isNull() ? 0 : s["ch"].as<uint8_t>();
+                    const bool enabled = s["en"].as<bool>();
+                    if (!update_sensor_settings((uint8_t)f, id, mode, channel,
+                        s["name"].isNull() ? nullptr : s["name"].as<const char *>(),
+                        s["en"].isNull() ? nullptr : &enabled))
+                        ESP_LOGW(TAG, "Sensor settings rejected: override capacity or save failure");
                 }
             }
             if (JsonArray srv = root["servers"].as<JsonArray>()) {
@@ -2906,6 +2930,7 @@ class EcowittRFSensor : public PollingComponent {
         DisplayHistory history{}; ForecastHistory forecast{}; forecast.seal();
         const ChannelHistory channels{}; const RainCheckpoint windows{};
         const RainTotalCheckpoint total{}; const ServerKeys keys{};
+        SensorOverrides overrides{}; overrides.seal();
         uint8_t servers[SERVERS_BLOB]{}; const uint32_t zero = 0; const float offset = 0;
         const bool saved = reset_application_preferences([&](uint32_t key) {
             switch (key) {
@@ -2924,6 +2949,7 @@ class EcowittRFSensor : public PollingComponent {
                 case PREF_PANEL_OPTIONS: return panel_options_pref_.save(&options);
                 case PREF_RAIN_TOTAL: return rain_total_pref_.save(&total);
                 case PREF_CHANNEL_HISTORY: return channel_history_pref_.save(&channels);
+                case PREF_SENSOR_OVERRIDES: return sensor_overrides_pref_.save(&overrides);
                 default: return false;
             }
         }, [] { return global_preferences->sync(); });
@@ -3047,6 +3073,7 @@ class EcowittRFSensor : public PollingComponent {
         load_cfg();
         load_servers();
         load_disabled();
+        load_sensors();
         load_panel();
         load_maxmin();
         rain_.set_calendar_policy({panel_options_.rain_day_hour, panel_options_.rain_week_monday, panel_options_.rain_season_month});
@@ -3710,6 +3737,7 @@ class EcowittRFSensor : public PollingComponent {
         panel_options_pref_ = global_preferences->make_preference<PanelOptions>(PREF_PANEL_OPTIONS, true);
         channel_history_pref_ = global_preferences->make_preference<ChannelHistory>(PREF_CHANNEL_HISTORY, true);
         rain_total_pref_ = global_preferences->make_preference<RainTotalCheckpoint>(PREF_RAIN_TOTAL, true);
+        sensor_overrides_pref_ = global_preferences->make_preference<SensorOverrides>(PREF_SENSOR_OVERRIDES, true);
         srv_keys_pref_ = global_preferences->make_preference<ServerKeys>(PREF_SRV_KEYS, true);
         rel_pref_ = global_preferences->make_preference<float>(PREF_PANEL_REL, true);
     }
@@ -3878,7 +3906,30 @@ class EcowittRFSensor : public PollingComponent {
         global_preferences->sync();
     }
 
-    void save_sensors() {}  // kept for the setter call sites; enable is handled by set_disabled
+    SensorOverrides sensor_overrides_;
+    ESPPreferenceObject sensor_overrides_pref_;
+    bool sensor_overrides_restored_ = false, sensor_overrides_save_ok_ = true;
+    void load_sensors() {
+        SensorOverrides stored;
+        sensor_overrides_restored_ = sensor_overrides_pref_.load(&stored) && stored.valid();
+        if (sensor_overrides_restored_) sensor_overrides_ = stored;
+        else { sensor_overrides_ = SensorOverrides{}; sensor_overrides_.seal(); }
+        for (uint8_t i = 0; i < sensor_overrides_.count; ++i) {
+            const auto &e = sensor_overrides_.entries[i];
+            SensorSlot &slot = sensor_slots_[sensor_count_++];
+            slot = SensorSlot{}; slot.family = e.key >> 24;
+            slot.id0 = e.key >> 16; slot.id1 = e.key >> 8; slot.id2 = e.key;
+            refresh_sensor_slot(slot);
+        }
+    }
+    bool save_sensor_overrides(SensorOverrides &next) {
+        sensor_overrides_save_ok_ = commit_sensor_overrides(sensor_overrides_, next,
+            [this](const SensorOverrides &value) { return sensor_overrides_pref_.save(&value); },
+            [] { return global_preferences->sync(); });
+        if (!sensor_overrides_save_ok_)
+            ESP_LOGW(TAG, "Sensor overrides could not be saved; previous settings retained");
+        return sensor_overrides_save_ok_;
+    }
 
     // Push persisted config into the live upload/poll state.
     void apply_cfg() {
@@ -3903,8 +3954,8 @@ class EcowittRFSensor : public PollingComponent {
         }
     }
 
-    // ---- per-sensor config (flash-persisted: enable + channel per sensor id) ----
-    SensorSlot sensor_slots_[SENSOR_MAX];
+    // ---- per-sensor config: explicit overrides + legacy enabled authority ----
+    SensorSlot sensor_slots_[SENSOR_MAX]{};
     uint8_t sensor_count_ = 0;
 
     int16_t find_sensor(uint8_t family, uint32_t id) const {
@@ -3916,49 +3967,49 @@ class EcowittRFSensor : public PollingComponent {
         return -1;
     }
 
-    // Ensure the sensor has a slot; apply its persisted channel; return whether enabled.
+    void refresh_sensor_slot(SensorSlot &slot) {
+        const uint32_t id = ((uint32_t)slot.id0 << 16) | ((uint32_t)slot.id1 << 8) | slot.id2;
+        const uint32_t key = ((uint32_t)slot.family << 24) | id;
+        slot.channel = sensor_overrides_.channel_for(key, slot.physical_channel);
+        slot.enabled = is_disabled(slot.family, id) ? 0 : 1;
+        snprintf(slot.name, sizeof(slot.name), "%s", sensor_overrides_.name_for(key));
+    }
+    // Learning alone never writes flash. Automatic channels follow current RF data.
     bool resolve_sensor(Reading &r) {
         int16_t idx = find_sensor((uint8_t)r.family, r.id);
-        if (idx >= 0) {
-            r.channel = sensor_slots_[idx].channel;
-            return sensor_slots_[idx].enabled != 0;
-        }
-        if (sensor_count_ < SENSOR_MAX) {
-            SensorSlot &s = sensor_slots_[sensor_count_++];
-            s.family = (uint8_t)r.family;
-            s.id0 = (r.id >> 16) & 0xFF;
-            s.id1 = (r.id >> 8) & 0xFF;
-            s.id2 = r.id & 0xFF;
-            s.channel = r.channel;
-            s.enabled = is_disabled((uint8_t)r.family, r.id) ? 0 : 1;  // apply persisted disable
-            save_sensors();
-        }
-        return true;
-    }
-
-    void set_sensor(uint8_t family, uint32_t id, uint8_t channel, bool enabled) {
-        int16_t idx = find_sensor(family, id);
         if (idx < 0) {
-            if (sensor_count_ >= SENSOR_MAX)
-                return;
+            if (sensor_count_ >= SENSOR_MAX) return false;
             idx = sensor_count_++;
-            sensor_slots_[idx].family = family;
-            sensor_slots_[idx].id0 = (id >> 16) & 0xFF;
-            sensor_slots_[idx].id1 = (id >> 8) & 0xFF;
-            sensor_slots_[idx].id2 = id & 0xFF;
+            sensor_slots_[idx] = SensorSlot{};
+            sensor_slots_[idx].family = (uint8_t)r.family;
+            sensor_slots_[idx].id0 = r.id >> 16; sensor_slots_[idx].id1 = r.id >> 8; sensor_slots_[idx].id2 = r.id;
         }
-        sensor_slots_[idx].channel = channel;
-        sensor_slots_[idx].enabled = enabled ? 1 : 0;
-        set_disabled(family, id, !enabled);
-        save_sensors();
+        SensorSlot &slot = sensor_slots_[idx];
+        slot.physical_channel = r.channel;
+        refresh_sensor_slot(slot);
+        r.channel = slot.channel;
+        return slot.enabled != 0;
     }
-    void set_sensor_name(uint8_t family, uint32_t id, const char *name) {
+    bool update_sensor_settings(uint8_t family, uint32_t id, SensorChannelMode mode,
+                                uint8_t channel, const char *name, const bool *enabled) {
         int16_t idx = find_sensor(family, id);
-        if (idx < 0)
-            return;
-        strncpy(sensor_slots_[idx].name, name, sizeof(sensor_slots_[idx].name) - 1);
-        sensor_slots_[idx].name[sizeof(sensor_slots_[idx].name) - 1] = 0;
-        save_sensors();
+        if (idx < 0 && sensor_count_ >= SENSOR_MAX) return false;
+        const uint32_t key = ((uint32_t)family << 24) | id;
+        SensorOverrides next = sensor_overrides_;
+        if (!next.update(key, mode, channel, name) || !save_sensor_overrides(next)) return false;
+        if (enabled) set_disabled(family, id, !*enabled);
+        if (idx < 0) {
+            idx = sensor_count_++;
+            sensor_slots_[idx] = SensorSlot{};
+            sensor_slots_[idx].family = family;
+            sensor_slots_[idx].id0 = id >> 16; sensor_slots_[idx].id1 = id >> 8; sensor_slots_[idx].id2 = id;
+        }
+        refresh_sensor_slot(sensor_slots_[idx]);
+        for (size_t i = 0; i < roster_count_; ++i)
+            if ((uint8_t)roster_[i].family == family && roster_[i].id == id)
+                roster_[i].channel = sensor_slots_[idx].channel;
+        refresh_ext_chans(); panel_.fx_redraw = true;
+        return true;
     }
 
     // ---- learned-sensor roster (RAM-only live state, not persisted) ----
