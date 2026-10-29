@@ -1002,7 +1002,7 @@ class EcowittRFSensor : public PollingComponent {
         j.field("heap", (uint32_t)ESP.getFreeHeap());
         j.field("uptime", (uint32_t)(millis() / 1000));
         j.field("fw", ESPHOME_VERSION);
-        j.field("build", "sensor-overrides-20261029a");
+        j.field("build", "sensor-overrides-20261029b");
         j.field("ts", (uint32_t)::time(nullptr));
 
         j.field("reset_reason", (int)esp_reset_reason());
@@ -1266,7 +1266,8 @@ class EcowittRFSensor : public PollingComponent {
                     uint32_t id = 0;
                     if (family == Family::Unknown || !parse_sensor_override_id(row["id"].as<const char *>(), id)) return false;
                     if (!row["ch"].isNull() && (!row["ch"].is<int>() ||
-                        !sensor_override_channel_valid((uint8_t)family, row["ch"].as<int>()))) return false;
+                        (!row["channel_auto"].as<bool>() &&
+                         !sensor_override_channel_valid((uint8_t)family, row["ch"].as<int>())))) return false;
                     if (!row["name"].isNull() && (!row["name"].is<const char *>() ||
                         strlen(row["name"].as<const char *>()) >= sizeof(SensorOverrides::Entry::name))) return false;
                     if (!row["en"].isNull() && !row["en"].is<bool>()) return false;
